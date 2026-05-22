@@ -1,0 +1,67 @@
+# =========================================================================
+# Unified pipeline config. Edit `plan.plan_id` to switch plans.
+# =========================================================================
+
+plan:
+  plan_id: BTP_June_Plan_V_384072
+
+db:
+  host: 35.208.174.2
+  port: 3306
+  user: root
+  password: Dev112233
+  database: jkplanningV1
+
+paths:
+  input_dir: input
+  output_dir: output
+
+# -------------------------------------------------------------------------
+# Phase A — demand extract (compute ConsolidatedPriorityScore)
+# -------------------------------------------------------------------------
+demand:
+  # Demand is read from jkt_demand DB table (filtered by plan_id).
+  output_excel: "requirement_summary_{plan_id}.xlsx"
+  output_sheet: requirement_summary
+  market_aliases:
+    OE: oe
+    Replacement: re
+    RE: re
+    ST: st
+    Defence: defence
+    Export: export
+    OTR: otr
+    Government: government
+  default_weights:
+    market: 0.50
+    quantity: 0.20
+    date: 0.30
+  market_score_scale:
+    min: 1
+    max: 7
+
+# -------------------------------------------------------------------------
+# Phase B — LP scheduler (curing schedule)
+# -------------------------------------------------------------------------
+schedule:
+  output_excel: "PCR_Schedule_{plan_id}_{plan_start}_{planning_days}days.xlsx"
+  tyre_type: pcr
+  shifts_per_day: 3
+  hours_per_shift: 8
+  shift_start_hour: 7
+  cavities_per_mould: 2
+  moulds_per_press: 2
+  new_mould_life: 3000
+  changeover_duration_min: 300
+  cleaning_duration_min: 120
+  load_unload_buffer_min: 2.3
+  press_efficiency: 0.9
+  max_changeovers_per_shift: 5
+  changeover_penalty_weight: 0.01
+  permissive_mould_eligibility: true
+
+# -------------------------------------------------------------------------
+# Phase C — upload schedule outputs back to DB
+# -------------------------------------------------------------------------
+upload:
+  created_by: Algo8 AI

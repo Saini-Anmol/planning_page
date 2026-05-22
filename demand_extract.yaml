@@ -1,0 +1,35 @@
+db:
+  host: 35.208.174.2
+  port: 3306
+  user: root
+  password: Dev112233
+  database: jkplanningV1
+
+input:
+  excel_path: Book4.xlsx
+  sheet: Sheet1
+
+output:
+  excel_path: requirement_summary_{plan_id}.xlsx
+  sheet_name: requirement_summary
+
+# Sheet1's free-text Market values mapped to the rank columns in jkt_plan_params.
+market_aliases:
+  OE: oe
+  Replacement: re
+  RE: re
+  ST: st
+  Defence: defence
+  Export: export
+  OTR: otr
+  Government: government
+
+# Used only when the DB row's weights are NULL or 0. Will be renormalized to sum to 1.
+default_weights:
+  market: 0.50
+  quantity: 0.20
+  date: 0.30
+
+market_score_scale:
+  min: 1
+  max: 7
