@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Build artifacts
+build.log
+output/*.xlsx
+load_*.xlsx
+df_shift*.xlsx
+*.log

@@ -2,7 +2,7 @@
 HTTP layer — wraps the demand → schedule → upload pipeline.
 
 Endpoint:
-    POST /app/v1/jkt/planning-scheduling/plan/generate-
+    POST /app/v1/jkt/planning-scheduling/plan/generate-plan
     body: {"plan_id": "<id>"}
 
 Returns JSON. Synchronous: response arrives after the full pipeline completes
@@ -21,7 +21,29 @@ from V1.utilities import config_loader
 from V1.utilities.exceptions import PipelineError
 
 
-bp = Blueprint("planning", __name__, url_prefix="/app/v1/jkt/planning-scheduling")
+# =============================================================================
+# PUBLIC API ENDPOINT
+# =============================================================================
+# Full URL when Flask is hosted at 35.208.174.2:5001:
+#   POST http://35.208.174.2:5001/app/v1/jkt/planning-scheduling/plan/generate-plan
+#
+# When running locally:
+#   POST http://localhost:5001/app/v1/jkt/planning-scheduling/plan/generate-plan
+#
+# Body (JSON):    {"plan_id": "<id>"}
+# Health-check:   GET  http://<host>:5001/app/v1/jkt/planning-scheduling/health
+# =============================================================================
+API_HOST            = "35.208.174.2"                       # public host for prod
+API_PORT            = 5001
+API_URL_PREFIX      = "/app/v1/jkt/planning-scheduling"
+API_GENERATE_PATH   = "/plan/generate-plan"
+API_HEALTH_PATH     = "/health"
+
+# Convenience: the literal URL strings other code or docs can reference.
+GENERATE_URL = f"http://{API_HOST}:{API_PORT}{API_URL_PREFIX}{API_GENERATE_PATH}"
+HEALTH_URL   = f"http://{API_HOST}:{API_PORT}{API_URL_PREFIX}{API_HEALTH_PATH}"
+
+bp = Blueprint("planning", __name__, url_prefix=API_URL_PREFIX)
 
 # Mirrors jkt_plan_params.plan_id VARCHAR(50). Keep in sync if the DB column changes.
 _PLAN_ID_MAX_LEN = 50
@@ -51,7 +73,7 @@ def _extract_plan_id(req) -> tuple[str | None, str | None]:
     return plan_id, None
 
 
-@bp.route("/plan/generate-", methods=["POST"])
+@bp.route(API_GENERATE_PATH, methods=["POST"])
 def generate_plan():
     plan_id, err = _extract_plan_id(request)
     if err:
@@ -98,6 +120,6 @@ def generate_plan():
     })
 
 
-@bp.route("/health", methods=["GET"])
+@bp.route(API_HEALTH_PATH, methods=["GET"])
 def health():
     return jsonify({"status": "ok"})

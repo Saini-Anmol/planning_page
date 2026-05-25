@@ -6,10 +6,15 @@ plan:
   plan_id: BTP_June_Plan_V_384072
 
 db:
-  host: 35.208.174.2
+  # DB credentials are loaded from environment variables at runtime:
+  #   JKT_DB_HOST, JKT_DB_PORT, JKT_DB_USER, JKT_DB_PASSWORD, JKT_DB_DATABASE
+  # For local dev, create a .env file (see .env.example). For Docker, pass
+  # them via `docker run --env-file .env ...`. Values below are placeholder
+  # fallbacks only — leave them empty so missing-env errors are loud.
+  host: ""
   port: 3306
-  user: root
-  password: Dev112233
+  user: ""
+  password: ""
   database: jkplanningV1
 
 paths:

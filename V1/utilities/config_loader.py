@@ -1,6 +1,19 @@
-"""YAML config loader. Resolves {plan_id} placeholders in path strings."""
+"""YAML config loader.
+
+Two responsibilities:
+  1. Read the YAML structure (plan, paths, demand, schedule, upload).
+  2. Pull DB credentials from environment variables (so secrets never need
+     to live in the YAML committed to git or baked into the Docker image).
+
+Env-var precedence:
+  - JKT_DB_HOST / JKT_DB_PORT / JKT_DB_USER / JKT_DB_PASSWORD / JKT_DB_DATABASE
+    override whatever is in config.yaml when set.
+  - If a project-root .env file is present, its KEY=VAL lines are loaded into
+    os.environ before override resolution (convenience for local dev).
+"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +22,49 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+DOTENV_PATH = PROJECT_ROOT / ".env"
+
+_DB_ENV_MAP = {
+    "host":     "JKT_DB_HOST",
+    "port":     "JKT_DB_PORT",
+    "user":     "JKT_DB_USER",
+    "password": "JKT_DB_PASSWORD",
+    "database": "JKT_DB_DATABASE",
+}
+
+
+def _load_dotenv_if_present() -> None:
+    """Minimal KEY=VAL parser — no python-dotenv dependency. Skipped silently
+    if no .env file exists (e.g., inside the Docker container)."""
+    if not DOTENV_PATH.exists():
+        return
+    with open(DOTENV_PATH) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+
+
+def _apply_db_env_overrides(cfg: dict) -> None:
+    cfg.setdefault("db", {})
+    for cfg_key, env_name in _DB_ENV_MAP.items():
+        val = os.environ.get(env_name)
+        if val is None:
+            continue
+        cfg["db"][cfg_key] = int(val) if cfg_key == "port" else val
 
 
 def load(path: Path | str | None = None) -> dict:
-    """Load YAML config from disk. Returns the parsed dict as-is."""
+    """Load YAML config from disk + apply env-var overrides for DB creds."""
+    _load_dotenv_if_present()
     p = Path(path) if path else DEFAULT_CONFIG_PATH
     with open(p) as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+    _apply_db_env_overrides(cfg)
+    return cfg
 
 
 def resolve_paths(cfg: dict) -> dict:

@@ -1,0 +1,46 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Editor / IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Legacy V0 scripts — replaced by V1/* modules, kept only for reference
+demand_extract.py
+demand_extract.yaml
+jk_curing_lp_PCR.py
+upload.ipynb
+
+# Debug Excel side-effects from the legacy scheduler's ETL methods.
+# These get re-created at runtime in /app, no need to ship stale copies.
+load_*.xlsx
+df_shift*.xlsx
+
+# Per-run outputs (the container generates these fresh)
+output/*.xlsx
+
+# Reference / input Excel files no longer used (demand reads from jkt_demand DB).
+input/
+
+# Local dev artifacts
+*.log
+.venv/
+venv/
+
+# Secrets — must come from `docker run --env-file .env` at runtime,
+# not be baked into the image.
+.env
+.env.*
+
+# Tests are nice-to-have for the image but not required at runtime
+# (uncomment if you want a smaller image):
+# smoke_test.py

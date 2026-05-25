@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-TEST_PLAN_ID = "BTP_June_Plan_V1184_472835"   # known to have rows in jkt_demand
+TEST_PLAN_ID = "BTP_June_Plan_V457_386001"   # known to have rows in jkt_demand
 
 CHECKS: list[tuple[str, callable]] = []
 
@@ -188,7 +188,7 @@ def _():
     from app import create_app
     app = create_app()
     rules = {r.rule for r in app.url_map.iter_rules()}
-    assert "/app/v1/jkt/planning-scheduling/plan/generate-" in rules
+    assert "/app/v1/jkt/planning-scheduling/plan/generate-plan" in rules
     assert "/app/v1/jkt/planning-scheduling/health" in rules
 
 
@@ -205,7 +205,7 @@ def _():
 def _():
     from app import create_app
     client = create_app().test_client()
-    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-",
+    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-plan",
                     json={})
     assert r.status_code == 400, r.status_code
     assert r.get_json()["status"] == "error"
@@ -217,7 +217,7 @@ def _():
     from jkt_plan_params — pipeline returns 404, but only after extracting."""
     from app import create_app
     client = create_app().test_client()
-    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-",
+    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-plan",
                     json={"plan_id": "  __DOES_NOT_EXIST__  "})  # whitespace test
     body = r.get_json()
     # Should fail at duplicate_check or plan_params lookup, NOT at validation.
@@ -231,7 +231,7 @@ def _():
 def _():
     from app import create_app
     client = create_app().test_client()
-    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-",
+    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-plan",
                     json={"plan_id": 12345})
     assert r.status_code == 400, r.status_code
     assert "must be a string" in r.get_json()["message"]
@@ -241,7 +241,7 @@ def _():
 def _():
     from app import create_app
     client = create_app().test_client()
-    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-",
+    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-plan",
                     data="not json at all",
                     content_type="application/json")
     assert r.status_code == 400, r.status_code
@@ -250,11 +250,22 @@ def _():
 
 @check("flask: /generate- rejects already-scheduled plan_id with 409")
 def _():
-    """Use TEST_PLAN_ID since it's the one with rows in all 3 output tables."""
+    """Find any plan_id with rows in jkt_plan_kpis; skip cleanly if there's none."""
+    from V1.utilities import config_loader, db
     from app import create_app
+    cfg = config_loader.load()
+    conn = db.connect(cfg["db"])
+    cur = conn.cursor()
+    cur.execute("SELECT plan_id FROM jkt_plan_kpis LIMIT 1")
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row:
+        print("        (no scheduled plan_id in DB — skipping)")
+        return
+    scheduled_pid = row[0]
     client = create_app().test_client()
-    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-",
-                    json={"plan_id": TEST_PLAN_ID})
+    r = client.post("/app/v1/jkt/planning-scheduling/plan/generate-plan",
+                    json={"plan_id": scheduled_pid})
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.get_json()}"
     body = r.get_json()
     assert body["status"] == "error"

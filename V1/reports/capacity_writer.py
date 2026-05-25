@@ -40,16 +40,18 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     # Fleet denominator: every PCR press listed in the Machine Utilization sheet
     # (row 4 onwards), regardless of whether it ran that day. This matches how
     # the scheduler's own "Avg: X%" headline is computed.
+    # IMPORTANT: Machine Utilization stores machine IDs as int, but Shift Schedule
+    # stores them as str. Coerce to str on both sides so set lookups match.
     ws_util = wb["Machine Utilization"]
     all_machines: set = set()
     for r in range(4, ws_util.max_row + 1):
         m = ws_util.cell(row=r, column=1).value
         if m is not None:
-            all_machines.add(m)
+            all_machines.add(str(m))
     if not all_machines:
         raise ValueError("Machine Utilization sheet has no machines listed")
 
-    # Per-(date, machine) busy minutes.
+    # Per-(date, machine) busy minutes. Keys use str(machine) to align with all_machines.
     ws = wb["Shift Schedule"]
     busy: dict = defaultdict(float)
     for r in range(4, ws.max_row + 1):
@@ -59,7 +61,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
         if machine is None or s is None or e is None or e <= s:
             continue
         for d, mins in _split_by_date(s, e):
-            busy[(d, machine)] += mins
+            busy[(d, str(machine))] += mins
 
     # Emit one row per date in the plan window. Idle days get an honest 0%
     # rather than being skipped.
