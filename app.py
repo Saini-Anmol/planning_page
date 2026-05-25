@@ -4,7 +4,7 @@ Flask app entry point. Run with:
     python app.py
 
 Listens on http://localhost:5001. The planning endpoint is at:
-    POST http://localhost:5001/app/v1/jkt/planning-scheduling/plan/generate-
+    POST http://localhost:5001/app/v1/jkt/planning-scheduling/plan/generate-plan
     body: {"plan_id": "<id>"}
 """
 from __future__ import annotations
