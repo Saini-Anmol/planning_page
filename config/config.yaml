@@ -45,6 +45,22 @@ demand:
     min: 1
     max: 7
 
+  # Fallback per-market scores — used ONLY when the plan_params row's rank
+  # columns (oe / re / st / defence / export / otr / government) are NULL.
+  # Values are SCORES (not ranks): higher = higher priority, range = market_score_scale.
+  # Keys match `market_aliases` keys (the free-text market names).
+  # When the DB has actual ranks, those win and this section is ignored — which is
+  # the production/API path. The fallback only kicks in for local testing where the
+  # plan row may have NULL ranks.
+  default_market_scores:
+    OE: 7
+    Replacement: 1
+    ST: 2
+    Defence: 3
+    Export: 6
+    OTR: 4
+    Government: 5
+
 # -------------------------------------------------------------------------
 # Phase B — LP scheduler (curing schedule)
 # -------------------------------------------------------------------------
@@ -60,7 +76,7 @@ schedule:
   changeover_duration_min: 300
   cleaning_duration_min: 120
   load_unload_buffer_min: 2.3
-  press_efficiency: 0.9
+  press_efficiency: 0.94
   max_changeovers_per_shift: 5
   changeover_penalty_weight: 0.01
   permissive_mould_eligibility: true

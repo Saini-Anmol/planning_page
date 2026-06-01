@@ -365,6 +365,21 @@ def _():
         assert isinstance(desc, str) and desc.strip(), f"bad desc for {sku!r}: {desc!r}"
 
 
+@check("kpi_writer: demand-weighted fulfillment caps each SKU at 100%")
+def _():
+    """Synthetic sheet: SKU A over-fulfilled (120%), SKU B at 80%, equal demand.
+    Capped weighted = (1.0·100 + 0.8·100)/200 = 90%. Uncapped would be 100%."""
+    import openpyxl
+    from V1.reports.kpi_writer import _demand_weighted_fulfillment
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.append(["title"]); ws.append(["summary"])
+    ws.append(["SKUCode","Priority","Demand","GT","Planned_Units","Gap","Fulfillment_Pct"])
+    ws.append(["A", 0, 100, 0, 120, 0, 1.2])   # over-fulfilled → capped to 1.0
+    ws.append(["B", 0, 100, 0,  80, 0, 0.8])
+    result = _demand_weighted_fulfillment(ws)
+    assert abs(result - 90.0) < 0.01, f"expected 90.0, got {result}"
+
+
 @check("capacity_writer: divides by full fleet, not just used machines")
 def _():
     """Read the source to confirm the denominator switched to all_machines."""

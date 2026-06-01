@@ -27,21 +27,17 @@ def _split_by_date(start: datetime, end: datetime):
         cur = chunk_end
 
 
-def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
-    # Fetch the plan window.
-    plan_row = plan_params.fetch(db_cfg, plan_id)
-    plan_start = plan_row["planStartDate"]
-    plan_end   = plan_row["planEndDate"]
-    if isinstance(plan_start, datetime): plan_start = plan_start.date()
-    if isinstance(plan_end,   datetime): plan_end   = plan_end.date()
+def compute_daily_utilisation(wb, plan_start, plan_end) -> list[tuple]:
+    """Return [(date, util_pct), ...] for each day in the plan window.
 
-    wb = openpyxl.load_workbook(schedule_path, data_only=True)
+    Per-machine util = busy_min / 1440 (full calendar day), capped at 100%.
+    Date-level util = mean across the full fleet (all machines in the Machine
+    Utilization sheet, idle ones included as 0%).
 
-    # Fleet denominator: every PCR press listed in the Machine Utilization sheet
-    # (row 4 onwards), regardless of whether it ran that day. This matches how
-    # the scheduler's own "Avg: X%" headline is computed.
-    # IMPORTANT: Machine Utilization stores machine IDs as int, but Shift Schedule
-    # stores them as str. Coerce to str on both sides so set lookups match.
+    Shared by capacity_writer (per-date rows) and kpi_writer (overall average)
+    so both use the identical denominator and capping.
+    """
+    # Fleet — Machine Utilization stores IDs as int, Shift Schedule as str.
     ws_util = wb["Machine Utilization"]
     all_machines: set = set()
     for r in range(4, ws_util.max_row + 1):
@@ -51,7 +47,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     if not all_machines:
         raise ValueError("Machine Utilization sheet has no machines listed")
 
-    # Per-(date, machine) busy minutes. Keys use str(machine) to align with all_machines.
+    # Per-(date, machine) busy minutes.
     ws = wb["Shift Schedule"]
     busy: dict = defaultdict(float)
     for r in range(4, ws.max_row + 1):
@@ -63,19 +59,31 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
         for d, mins in _split_by_date(s, e):
             busy[(d, str(machine))] += mins
 
-    # Emit one row per date in the plan window. Idle days get an honest 0%
-    # rather than being skipped.
     n_machines = len(all_machines)
-    now = datetime.now()
-    rows = []
+
+    result = []
     d = plan_start
     while d <= plan_end:
-        utils = [min(busy[(d, m)] / 1440, 1.0) for m in all_machines]
+        utils = [min(busy[(d, m)] / 1440.0, 1.0) for m in all_machines]
         util_pct = round(sum(utils) / n_machines * 100, 2)
-        rows.append((plan_id, d, util_pct, now, created_by))
+        result.append((d, util_pct))
         d += timedelta(days=1)
-    print(f"[upload:capacity] {len(rows)} dates × {n_machines} machines fleet "
-          f"(plan window {plan_start}..{plan_end})")
+    return result
+
+
+def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
+    plan_row = plan_params.fetch(db_cfg, plan_id)
+    plan_start = plan_row["planStartDate"]
+    plan_end   = plan_row["planEndDate"]
+    if isinstance(plan_start, datetime): plan_start = plan_start.date()
+    if isinstance(plan_end,   datetime): plan_end   = plan_end.date()
+
+    wb = openpyxl.load_workbook(schedule_path, data_only=True)
+    daily = compute_daily_utilisation(wb, plan_start, plan_end)
+
+    now = datetime.now()
+    rows = [(plan_id, d, util_pct, now, created_by) for d, util_pct in daily]
+    print(f"[upload:capacity] {len(rows)} dates (plan window {plan_start}..{plan_end})")
 
     conn = connect(db_cfg)
     try:

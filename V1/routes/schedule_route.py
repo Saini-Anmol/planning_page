@@ -97,7 +97,7 @@ class Config:
     CHANGEOVER_DURATION_MIN = 300
     CLEANING_DURATION_MIN   = 120
     LOAD_UNLOAD_BUFFER_MIN  = 2.3
-    PRESS_EFFICIENCY        = 0.9
+    PRESS_EFFICIENCY        = 0.94
 
     # ── changeover scheduling ─────────────────────────────────────────────────
     MAX_CHANGEOVERS_PER_SHIFT = 5

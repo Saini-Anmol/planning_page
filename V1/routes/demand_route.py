@@ -34,19 +34,48 @@ def _resolve_weights(plan_row: dict, defaults: dict) -> tuple[float, float, floa
     return w_m / total, w_q / total, w_d / total
 
 
-def _market_score(market: Any, plan_row: dict, aliases: dict, smin: int, smax: int) -> int:
+def _market_score(market: Any, plan_row: dict, aliases: dict, smin: int, smax: int,
+                  default_scores: dict | None = None) -> int:
+    """Resolve a per-SKU market score in [smin, smax]. Higher = higher priority.
+
+    Resolution order:
+      1. DB rank in plan_row[<alias>]: convert rank → score (inverts: rank 1 → smax).
+      2. YAML default_scores[<market alias key>]: use as score DIRECTLY (no inversion).
+      3. smin (lowest priority) as a final safety net.
+
+    Production/API runs go through step 1 since plan_params is populated.
+    Local testing with a sparse plan_params row falls through to step 2.
+    """
     if not market:
         return smin
     key = str(market).strip()
-    col = (aliases.get(key) or aliases.get(key.title())
-           or aliases.get(key.upper()) or aliases.get(key.lower()))
-    if not col:
+
+    # Find the canonical alias key (case-tolerant) so we can look up both
+    # the DB column name and the YAML default by the same canonical name.
+    canonical = None
+    for variant in (key, key.title(), key.upper(), key.lower()):
+        if variant in aliases:
+            canonical = variant
+            break
+    if not canonical:
         return smin
+
+    col = aliases[canonical]
+
+    # 1. DB rank (preferred — production path).
     rank = plan_row.get(col)
-    if rank is None:
-        return smin
-    rank = max(smin, min(smax, int(rank)))
-    return smax + smin - rank
+    if rank is not None:
+        rank = max(smin, min(smax, int(rank)))
+        return smax + smin - rank
+
+    # 2. YAML default score (local-testing fallback only).
+    if default_scores:
+        default = default_scores.get(canonical)
+        if default is not None:
+            return max(smin, min(smax, int(default)))
+
+    # 3. Last-resort fallback.
+    return smin
 
 
 def _as_date(v):
@@ -59,13 +88,14 @@ def _as_date(v):
     return None
 
 
-def _compute_cps(rows: list[dict], plan_row: dict, weights, aliases, smin, smax) -> None:
+def _compute_cps(rows: list[dict], plan_row: dict, weights, aliases, smin, smax,
+                 default_scores: dict | None = None) -> None:
     plan_start = _as_date(plan_row.get("planStartDate"))
     plan_end   = _as_date(plan_row.get("planEndDate"))
     horizon = (plan_end - plan_start).days if (plan_start and plan_end) else 0
 
     for r in rows:
-        r["_market_score"] = _market_score(r["Market"], plan_row, aliases, smin, smax)
+        r["_market_score"] = _market_score(r["Market"], plan_row, aliases, smin, smax, default_scores)
         td = _as_date(r["Delivery date"])
         r["_ttt"] = (td - plan_start).days if (td and plan_start) else horizon
 
@@ -119,7 +149,9 @@ def run(cfg: dict) -> Path:
 
     smin = int(cfg["demand"]["market_score_scale"]["min"])
     smax = int(cfg["demand"]["market_score_scale"]["max"])
-    _compute_cps(rows, plan_row, weights, cfg["demand"]["market_aliases"], smin, smax)
+    default_scores = cfg["demand"].get("default_market_scores")
+    _compute_cps(rows, plan_row, weights, cfg["demand"]["market_aliases"], smin, smax,
+                 default_scores=default_scores)
 
     _write_output(rows, out_path, cfg["demand"]["output_sheet"])
     print(f"[demand] wrote {out_path}")

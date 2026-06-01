@@ -7,6 +7,8 @@ from pathlib import Path
 
 import openpyxl
 
+from V1.reports.capacity_writer import compute_daily_utilisation
+from V1.setups import plan_params
 from V1.utilities.db import connect
 
 
@@ -45,6 +47,44 @@ def _count_demand_skus(plan_id: str, db_cfg: dict) -> int:
         conn.close()
 
 
+def _demand_weighted_fulfillment(ws) -> float:
+    """Overall demand fulfillment as a demand-weighted average of per-SKU
+    fulfillment, with each SKU capped at 100%:
+
+        Σ_i [ min(planned_i / demand_i, 1.0) · (demand_i / Σ demand) ]  × 100
+
+    Capping prevents over-produced SKUs from masking shortfalls on others.
+    Demand Fulfillment sheet columns: 3 = Demand, 5 = Planned_Units.
+    """
+    total_demand = 0.0
+    weighted = 0.0
+    for r in range(4, ws.max_row + 1):
+        if not ws.cell(row=r, column=1).value:
+            continue
+        demand  = ws.cell(row=r, column=3).value or 0
+        planned = ws.cell(row=r, column=5).value or 0
+        if demand <= 0:
+            continue
+        total_demand += demand
+        weighted += min(planned / demand, 1.0) * demand
+    if total_demand == 0:
+        return 0.0
+    return round(weighted / total_demand * 100, 2)
+
+
+def _overall_capacity_utilisation(wb, plan_id: str, db_cfg: dict) -> float:
+    """Mean of the per-date fleet utilisations — same full-day (1440 min) math
+    the capacity_writer uses, so the KPI matches jkt_plan_capacityUtilisation."""
+    plan_row = plan_params.fetch(db_cfg, plan_id)
+    ps, pe = plan_row["planStartDate"], plan_row["planEndDate"]
+    if isinstance(ps, datetime): ps = ps.date()
+    if isinstance(pe, datetime): pe = pe.date()
+    daily = compute_daily_utilisation(wb, ps, pe)
+    if not daily:
+        return 0.0
+    return round(sum(u for _, u in daily) / len(daily), 2)
+
+
 def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
     ws = wb["Demand Fulfillment"]
@@ -56,12 +96,16 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     demand_sku = _count_demand_skus(plan_id, db_cfg)
     plan_sku   = _count_sku_rows(ws)
 
+    # demandFulfillment = demand-weighted average of per-SKU fulfillment, each
+    #   SKU capped at 100% (computed, not parsed from the headline).
+    # capacityUtilisation = mean of per-date fleet utilisation against the full
+    #   1440-min day (matches jkt_plan_capacityUtilisation).
     row = {
         "plan_id":             plan_id,
-        "demandFulfillment":   float(_require(r"Fulfillment:\s*([\d.]+)\s*%", summary)),
+        "demandFulfillment":   _demand_weighted_fulfillment(ws),
         "demandSKU":           demand_sku,
         "planSKU":             plan_sku,
-        "capacityUtilisation": float(_require(r"Avg Util:\s*([\d.]+)\s*%", summary)),
+        "capacityUtilisation": _overall_capacity_utilisation(wb, plan_id, db_cfg),
         "curingChangeovers":   int(_require(r"Changeovers:\s*([\d,]+)", summary).replace(",", "")),
         "createdAt":           datetime.now(),
         "createdBy":           created_by,
