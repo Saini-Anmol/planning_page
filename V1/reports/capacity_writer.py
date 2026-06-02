@@ -16,6 +16,7 @@ import openpyxl
 
 from V1.setups import plan_params
 from V1.utilities.db import connect
+from V1.utilities.time_utils import now_ist
 
 
 def _split_by_date(start: datetime, end: datetime):
@@ -47,14 +48,24 @@ def compute_daily_utilisation(wb, plan_start, plan_end) -> list[tuple]:
     if not all_machines:
         raise ValueError("Machine Utilization sheet has no machines listed")
 
-    # Per-(date, machine) busy minutes.
+    # Per-(date, machine) busy minutes. PRODUCTIVE time only — changeover and
+    # mould-clean rows are skipped so utilization reflects "press actually
+    # producing tyres" not "press occupied for any reason".
     ws = wb["Shift Schedule"]
     busy: dict = defaultdict(float)
     for r in range(4, ws.max_row + 1):
         machine = ws.cell(row=r, column=3).value
+        sku     = ws.cell(row=r, column=4).value
         s       = ws.cell(row=r, column=5).value
         e       = ws.cell(row=r, column=6).value
+        remarks = ws.cell(row=r, column=10).value or ""
         if machine is None or s is None or e is None or e <= s:
+            continue
+        # Skip changeover rows (SKUCode == 'CHANGEOVER') and mould-clean rows
+        # (Remarks contains 'Clean' or 'CLEAN'). Case-insensitive match.
+        sku_u = str(sku).upper() if sku else ""
+        remarks_u = str(remarks).upper()
+        if sku_u == "CHANGEOVER" or "CLEAN" in remarks_u or "CHANGEOVER" in remarks_u:
             continue
         for d, mins in _split_by_date(s, e):
             busy[(d, str(machine))] += mins
@@ -81,7 +92,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
     daily = compute_daily_utilisation(wb, plan_start, plan_end)
 
-    now = datetime.now()
+    now = now_ist()
     rows = [(plan_id, d, util_pct, now, created_by) for d, util_pct in daily]
     print(f"[upload:capacity] {len(rows)} dates (plan window {plan_start}..{plan_end})")
 

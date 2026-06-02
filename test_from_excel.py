@@ -43,18 +43,38 @@ def read_demand_from_excel(path: Path, sheet: str) -> list[dict]:
     ws = wb[sheet]
 
     rows: list[dict] = []
+    skipped = 0
     for r in range(2, ws.max_row + 1):
         sku = ws.cell(row=r, column=1).value
         if not sku:
             continue
+        req_raw = ws.cell(row=r, column=3).value
+        # Tolerate messy files:
+        #  - Excel cells stored as strings with commas ('2,362' → 2362) get cleaned.
+        #  - 'inf' / 'nan' / negatives rejected so they can't break normalization.
+        import math
+        try:
+            if isinstance(req_raw, str):
+                cleaned = req_raw.strip().replace(",", "")
+                req = float(cleaned) if cleaned else 0.0
+            else:
+                req = float(req_raw) if req_raw not in (None, "") else 0.0
+            if not math.isfinite(req) or req < 0:
+                skipped += 1
+                continue
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
         rows.append({
             "SKUCode":         sku,
             "SKU Description": ws.cell(row=r, column=2).value,
-            "Requirement":     ws.cell(row=r, column=3).value or 0,
+            "Requirement":     req,
             "Order Type":      ws.cell(row=r, column=4).value,
             "Market":          ws.cell(row=r, column=5).value,
             "Delivery date":   ws.cell(row=r, column=6).value,
         })
+    if skipped:
+        print(f"[test] skipped {skipped} rows with non-numeric Requirement (likely junk rows)")
     return rows
 
 
@@ -64,7 +84,21 @@ def main() -> int:
                    help="plan_id used to fetch weights + dates from jkt_plan_params (DB read-only)")
     p.add_argument("--book",  default="input/Book4.xlsx", help="path to demand Excel")
     p.add_argument("--sheet", default="Sheet1",          help="sheet name with the demand rows")
+    p.add_argument("--efficiency", type=float, default=None,
+                   help="Override press_efficiency percentage for this run (e.g., 94 = 94%%). "
+                        "Patches the plan_params row in memory only — DB is not touched.")
     args = p.parse_args()
+
+    # In-memory override of efficiency for testing without DB writes.
+    if args.efficiency is not None:
+        from V1.setups import plan_params as _pp
+        _orig_fetch = _pp.fetch
+        def _patched_fetch(db_cfg, plan_id):
+            row = _orig_fetch(db_cfg, plan_id)
+            row["efficiency"] = args.efficiency
+            return row
+        _pp.fetch = _patched_fetch
+        print(f"[test] efficiency override: using {args.efficiency}% instead of DB value")
 
     cfg = config_loader.load()
     cfg["plan"]["plan_id"] = args.plan_id

@@ -1692,6 +1692,27 @@ def _run_locked(cfg: dict) -> dict:
     out_name = out_template.format(plan_id=plan_id, plan_start=ps_date, planning_days=days)
     out_path = str(out_dir / out_name)
 
+    # --------------------------------------------------------------------
+    # DB overrides — jkt_plan_params values WIN over YAML defaults when set.
+    # These are the UI-driven knobs the user can edit per plan.
+    # --------------------------------------------------------------------
+    # noOfChangeOver: stored AS-IS as max changeovers per SHIFT (same unit
+    # the scheduler uses internally — no division). If NULL/0 → YAML default
+    # of 5/shift applies.
+    db_co_per_shift = plan_row.get("noOfChangeOver")
+    if db_co_per_shift is not None and int(db_co_per_shift) > 0:
+        Config.MAX_CHANGEOVERS_PER_SHIFT = int(db_co_per_shift)
+        print(f"[schedule] DB override: noOfChangeOver={db_co_per_shift} "
+              f"-> MAX_CHANGEOVERS_PER_SHIFT={Config.MAX_CHANGEOVERS_PER_SHIFT}/shift")
+
+    # efficiency: stored in the DB as a percentage (e.g., 94 for 94%).
+    # Config.PRESS_EFFICIENCY is a fraction (0.94). Convert.
+    db_eff = plan_row.get("efficiency")
+    if db_eff is not None and float(db_eff) > 0:
+        Config.PRESS_EFFICIENCY = float(db_eff) / 100.0
+        print(f"[schedule] DB override: efficiency={db_eff}% -> "
+              f"PRESS_EFFICIENCY={Config.PRESS_EFFICIENCY}")
+
     return run_from_database(
         plan_id     = plan_id,
         demand_csv  = str(in_path),

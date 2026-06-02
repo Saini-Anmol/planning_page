@@ -343,6 +343,20 @@ def _():
     assert hasattr(cw, "plan_params"), "capacity_writer should import plan_params"
 
 
+@check("schedule_route: DB overrides for noOfChangeOver + efficiency are wired in")
+def _():
+    """Verify the new DB-override block exists in _run_locked()."""
+    src = __import__("pathlib").Path("V1/routes/schedule_route.py").read_text()
+    assert "noOfChangeOver" in src, "noOfChangeOver override missing from schedule_route"
+    assert "MAX_CHANGEOVERS_PER_SHIFT = int(db_co_per_shift)" in src, \
+        "MAX_CHANGEOVERS_PER_SHIFT should be set DIRECTLY from DB (per-shift, no /3 division)"
+    assert "PRESS_EFFICIENCY = float(db_eff) / 100" in src, "efficiency not overridden from DB"
+    # Ensure the OLD per-day division logic is gone
+    assert "Config.SHIFTS_PER_DAY" not in (
+        src.split("noOfChangeOver", 1)[1].split("efficiency", 1)[0] if "noOfChangeOver" in src else ""
+    ), "Old /SHIFTS_PER_DAY division still present in noOfChangeOver block"
+
+
 @check("schedule_route: run() is serialized with a lock")
 def _():
     """Confirm the threading.Lock is in place and run() acquires it."""
@@ -365,6 +379,61 @@ def _():
         assert isinstance(desc, str) and desc.strip(), f"bad desc for {sku!r}: {desc!r}"
 
 
+@check("plan_writer: _round_sku_totals_up_to_even bumps odd SKUs by +1")
+def _():
+    from V1.reports.plan_writer import _round_sku_totals_up_to_even
+    # Two SKUs, A=odd total (101), B=even total (100). CHANGEOVER row skipped.
+    rows = [
+        ("pid", "A", "desc", None, None, None, None, 50, None, None, None, "by"),
+        ("pid", "A", "desc", None, None, None, None, 51, None, None, None, "by"),   # total A = 101 odd
+        ("pid", "B", "desc", None, None, None, None, 60, None, None, None, "by"),
+        ("pid", "B", "desc", None, None, None, None, 40, None, None, None, "by"),   # total B = 100 even
+        ("pid", "CHANGEOVER", None, None, None, None, None, 0, None, None, None, "by"),
+    ]
+    bumped = _round_sku_totals_up_to_even(rows)
+    assert bumped == 1, f"expected 1 SKU bumped, got {bumped}"
+    a_total = sum(r[7] for r in rows if r[1] == "A")
+    b_total = sum(r[7] for r in rows if r[1] == "B")
+    assert a_total == 102 and a_total % 2 == 0, f"A total should be even 102, got {a_total}"
+    assert b_total == 100, f"B unchanged, got {b_total}"
+
+
+@check("kpi_writer: demand-weighted fulfillment rounds planned UP to even per SKU")
+def _():
+    import openpyxl
+    from V1.reports.kpi_writer import _demand_weighted_fulfillment
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.append(["title"]); ws.append(["summary"])
+    ws.append(["SKUCode","Priority","Demand","GT","Planned_Units","Gap","Fulfillment_Pct"])
+    # Two SKUs, equal demand 100. Planned 99 (odd→100) vs 100. Expected = 100% capped.
+    ws.append(["A", 0, 100, 0,  99, 0, 0.99])
+    ws.append(["B", 0, 100, 0, 100, 0, 1.00])
+    result = _demand_weighted_fulfillment(ws)
+    assert abs(result - 100.0) < 0.01, f"expected 100.0 (both round to 100% capped), got {result}"
+
+
+@check("kpi_writer: _count_planned_skus excludes TOTAL row AND skus with Planned_Units=0")
+def _():
+    """planSKU should count only SKUs that actually got production:
+       - skip 'TOTAL' summary row
+       - skip SKUs with Planned_Units == 0 (status UNMET / UNSCHEDULABLE)"""
+    import openpyxl
+    from V1.reports.kpi_writer import _count_planned_skus, _demand_weighted_fulfillment
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.append(["title"]); ws.append(["summary"])
+    ws.append(["SKUCode","Priority","Demand","GT","Planned_Units","Gap","Fulfillment_Pct"])
+    ws.append(["A",      0, 100, 0, 100, 0, 1.0])      # planned > 0  → count
+    ws.append(["B",      0, 100, 0,  80, 0, 0.8])      # planned > 0  → count
+    ws.append(["C_UNMET",0, 100, 0,   0, 100, 0.0])    # planned = 0  → DO NOT count
+    ws.append(["TOTAL",  0, 300, 0, 180, 120, 0.6])    # summary row  → DO NOT count
+    n = _count_planned_skus(ws)
+    assert n == 2, f"expected planSKU=2 (only A and B have Planned>0), got {n}"
+    # Fulfillment should also exclude the TOTAL row but include C (it has demand>0)
+    f = _demand_weighted_fulfillment(ws)
+    # (1.0·100 + 0.8·100 + 0.0·100) / 300 = 60%
+    assert abs(f - 60.0) < 0.01, f"expected 60.0%, got {f}"
+
+
 @check("kpi_writer: demand-weighted fulfillment caps each SKU at 100%")
 def _():
     """Synthetic sheet: SKU A over-fulfilled (120%), SKU B at 80%, equal demand.
@@ -378,6 +447,34 @@ def _():
     ws.append(["B", 0, 100, 0,  80, 0, 0.8])
     result = _demand_weighted_fulfillment(ws)
     assert abs(result - 90.0) < 0.01, f"expected 90.0, got {result}"
+
+
+@check("capacity_writer: skips CHANGEOVER + mould-clean rows from busy time")
+def _():
+    """Productive util only — CO and clean rows must NOT count as busy."""
+    import openpyxl
+    from datetime import datetime, date
+    from V1.reports.capacity_writer import compute_daily_utilisation
+    # Build a minimal workbook with 1 machine, 1 day, and a mix of rows
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Shift Schedule"
+    ws.append(["title"]); ws.append(["summary"])
+    ws.append(["Date","Shift","Machine","SKUCode","StartTime","EndTime","Qty","CycleTime_min","GT","Remarks"])
+    d_obj = datetime(2026, 6, 1, 7, 0)
+    # 480 min production + 300 min CHANGEOVER + 120 min CLEAN  =  900 min total, 480 productive
+    ws.append([d_obj, "A", "M1", "SKU_A",     d_obj,                  datetime(2026,6,1,15,0), 30, 16, 0, "LP Scheduled"])
+    ws.append([d_obj, "B", "M1", "CHANGEOVER",datetime(2026,6,1,15,0),datetime(2026,6,1,20,0),  0,  0, 0, "C/O"])
+    ws.append([d_obj, "B", "M1", "SKU_A",     datetime(2026,6,1,20,0),datetime(2026,6,1,22,0), 10, 12, 0, "Mould Cleaning"])
+    # Machine Utilization sheet — fleet of 1
+    ws_u = wb.create_sheet("Machine Utilization")
+    ws_u.append(["title"]); ws_u.append(["summary"])
+    ws_u.append(["Machine","Avail","Used","Idle","Util","SKUs","Cycles","Units"])
+    ws_u.append(["M1", 1440, 480, 960, 0.33, 1, 0, 60])
+
+    daily = compute_daily_utilisation(wb, date(2026,6,1), date(2026,6,1))
+    util = daily[0][1]
+    # 480 productive min / 1440 = 33.33% (NOT 900/1440 = 62.5%)
+    assert abs(util - 33.33) < 0.5, f"expected ~33.33% (productive only), got {util}"
 
 
 @check("capacity_writer: divides by full fleet, not just used machines")

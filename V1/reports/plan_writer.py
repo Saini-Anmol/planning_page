@@ -7,8 +7,42 @@ from pathlib import Path
 import openpyxl
 
 from V1.utilities.db import connect
+from V1.utilities.time_utils import now_ist
 
 _BATCH = 1000
+
+# Index of `qty` and `sku_code` in the tuple appended to `rows`.
+_QTY_IDX = 7
+_SKU_IDX = 1
+
+
+def _round_sku_totals_up_to_even(rows: list[tuple]) -> int:
+    """Plant produces tyres in even counts only. Walk the rows, group by SKU,
+    and for any SKU whose total qty is odd, add +1 to the qty of that SKU's
+    first slot. Returns the number of SKUs that got bumped.
+
+    CHANGEOVER rows (qty=0) are excluded from the totals — they don't produce
+    tyres. Demand is NOT changed; only the planned qty gets nudged up by 1.
+    """
+    sku_total: dict = {}
+    sku_first: dict = {}
+    for i, r in enumerate(rows):
+        sku = r[_SKU_IDX]
+        qty = r[_QTY_IDX] or 0
+        if not sku or qty == 0:        # skip CHANGEOVER / cleaning rows
+            continue
+        sku_total[sku] = sku_total.get(sku, 0) + int(qty)
+        sku_first.setdefault(sku, i)
+
+    bumped = 0
+    for sku, total in sku_total.items():
+        if total % 2 == 1:
+            i = sku_first[sku]
+            row = list(rows[i])
+            row[_QTY_IDX] = (row[_QTY_IDX] or 0) + 1
+            rows[i] = tuple(row)
+            bumped += 1
+    return bumped
 
 
 def _load_sku_descriptions(plan_id: str, db_cfg: dict) -> dict[str, str]:
@@ -37,7 +71,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
 
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
     ws = wb["Shift Schedule"]
-    now = datetime.now()
+    now = now_ist()
 
     rows = []
     # Shift Schedule columns (v4): Date, Shift, Machine, SKUCode, StartTime,
@@ -62,6 +96,12 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
             now,
             created_by,
         ))
+
+    # Plant constraint: per-SKU planned qty must be EVEN. Add +1 tyre on the
+    # first slot of any SKU whose total is odd.
+    bumped = _round_sku_totals_up_to_even(rows)
+    if bumped:
+        print(f"[upload:plan] bumped +1 tyre on {bumped} SKUs to make totals even")
 
     conn = connect(db_cfg)
     try:
