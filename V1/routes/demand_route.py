@@ -117,12 +117,15 @@ def _compute_cps(rows: list[dict], plan_row: dict, weights, aliases, smin, smax,
 
 def _write_output(rows: list[dict], path: Path, sheet_name: str) -> None:
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet_name
-    ws.append(OUTPUT_COLS)
-    for r in rows:
-        ws.append([r.get(c) for c in OUTPUT_COLS])
-    wb.save(path)
+    try:
+        ws = wb.active
+        ws.title = sheet_name
+        ws.append(OUTPUT_COLS)
+        for r in rows:
+            ws.append([r.get(c) for c in OUTPUT_COLS])
+        wb.save(path)
+    finally:
+        wb.close()                                       # release file handle
 
 
 def run(cfg: dict) -> Path:

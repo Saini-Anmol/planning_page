@@ -73,6 +73,29 @@ def _count_demand_skus(plan_id: str, db_cfg: dict) -> int:
         conn.close()
 
 
+def _round_up_to_even(n: int) -> int:
+    """Single source of truth for the +1-tyre rule. Used by BOTH kpi_writer
+    and plan_writer so they can never disagree on what's 'rounded'."""
+    n = int(n)
+    return n + (n % 2)
+
+
+def _safe_number(v, default: float = 0.0) -> float:
+    """Robust cell-value → float. Tolerates messy Excel data: '#REF!', NaN,
+    string-with-comma, None, etc. Returns `default` on any failure."""
+    if v is None or v == "":
+        return default
+    if isinstance(v, (int, float)):
+        f = float(v)
+    else:
+        try:
+            f = float(str(v).strip().replace(",", ""))
+        except (ValueError, TypeError):
+            return default
+    import math
+    return f if math.isfinite(f) and f >= 0 else default
+
+
 def _demand_weighted_fulfillment(ws) -> float:
     """Overall demand fulfillment as a demand-weighted average of per-SKU
     fulfillment, with each SKU capped at 100%:
@@ -83,23 +106,23 @@ def _demand_weighted_fulfillment(ws) -> float:
     Demand Fulfillment sheet columns: 3 = Demand, 5 = Planned_Units.
 
     Plant constraint: per-SKU planned is rounded UP to the next even number
-    (the plant produces tyres in even counts). This matches the +1-tyre nudge
-    applied in plan_writer so the KPI agrees with the jkt_plan row totals.
+    (via shared `_round_up_to_even` helper — guarantees same value as plan_writer).
     """
     total_demand = 0.0
     weighted = 0.0
     for r in range(4, ws.max_row + 1):
         if not _is_real_sku_row(ws, r):
-            continue                    # skip 'TOTAL' summary row
-        demand  = ws.cell(row=r, column=3).value or 0
-        planned = ws.cell(row=r, column=5).value or 0
+            continue                                # skip 'TOTAL' summary row
+        demand  = _safe_number(ws.cell(row=r, column=3).value)
+        planned = _safe_number(ws.cell(row=r, column=5).value)
         if demand <= 0:
             continue
-        # Round planned UP to nearest even (mirrors plan_writer's even-only nudge).
-        planned = int(planned) + (int(planned) % 2)
+        planned = _round_up_to_even(planned)        # shared rule with plan_writer
         total_demand += demand
         weighted += min(planned / demand, 1.0) * demand
     if total_demand == 0:
+        print("[upload:kpi] WARNING — total_demand=0 in Demand Fulfillment sheet, "
+              "demandFulfillment will be reported as 0%")
         return 0.0
     return round(weighted / total_demand * 100, 2)
 
@@ -119,30 +142,25 @@ def _overall_capacity_utilisation(wb, plan_id: str, db_cfg: dict) -> float:
 
 def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
-    ws = wb["Demand Fulfillment"]
-    summary = ws.cell(row=2, column=1).value or ""
+    try:
+        ws = wb["Demand Fulfillment"]
+        summary = ws.cell(row=2, column=1).value or ""
 
-    # demandSKU comes from jkt_demand (the input — total SKUs requested).
-    # planSKU comes from the schedule output, counting ONLY SKUs that actually
-    # got production (Planned_Units > 0). Excludes the 'TOTAL' summary row
-    # AND any SKU with status UNMET / UNSCHEDULABLE (planned = 0).
-    demand_sku = _count_demand_skus(plan_id, db_cfg)
-    plan_sku   = _count_planned_skus(ws)
+        demand_sku = _count_demand_skus(plan_id, db_cfg)
+        plan_sku   = _count_planned_skus(ws)
 
-    # demandFulfillment = demand-weighted average of per-SKU fulfillment, each
-    #   SKU capped at 100% (computed, not parsed from the headline).
-    # capacityUtilisation = mean of per-date fleet utilisation against the full
-    #   1440-min day (matches jkt_plan_capacityUtilisation).
-    row = {
-        "plan_id":             plan_id,
-        "demandFulfillment":   _demand_weighted_fulfillment(ws),
-        "demandSKU":           demand_sku,
-        "planSKU":             plan_sku,
-        "capacityUtilisation": _overall_capacity_utilisation(wb, plan_id, db_cfg),
-        "curingChangeovers":   int(_require(r"Changeovers:\s*([\d,]+)", summary).replace(",", "")),
-        "createdAt":           now_ist(),
-        "createdBy":           created_by,
-    }
+        row = {
+            "plan_id":             plan_id,
+            "demandFulfillment":   _demand_weighted_fulfillment(ws),
+            "demandSKU":           demand_sku,
+            "planSKU":             plan_sku,
+            "capacityUtilisation": _overall_capacity_utilisation(wb, plan_id, db_cfg),
+            "curingChangeovers":   int(_require(r"Changeovers:\s*([\d,]+)", summary).replace(",", "")),
+            "createdAt":           now_ist(),
+            "createdBy":           created_by,
+        }
+    finally:
+        wb.close()                                       # release file handle
 
     conn = connect(db_cfg)
     try:

@@ -16,6 +16,7 @@ import openpyxl
 
 from V1.setups import plan_params
 from V1.utilities.db import connect
+from V1.utilities.exceptions import PipelineError
 from V1.utilities.time_utils import now_ist
 
 
@@ -46,7 +47,10 @@ def compute_daily_utilisation(wb, plan_start, plan_end) -> list[tuple]:
         if m is not None:
             all_machines.add(str(m))
     if not all_machines:
-        raise ValueError("Machine Utilization sheet has no machines listed")
+        raise PipelineError(
+            "Machine Utilization sheet has no machines listed",
+            stage="upload", status_code=412,
+        )
 
     # Per-(date, machine) busy minutes. PRODUCTIVE time only — changeover and
     # mould-clean rows are skipped so utilization reflects "press actually
@@ -90,7 +94,10 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     if isinstance(plan_end,   datetime): plan_end   = plan_end.date()
 
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
-    daily = compute_daily_utilisation(wb, plan_start, plan_end)
+    try:
+        daily = compute_daily_utilisation(wb, plan_start, plan_end)
+    finally:
+        wb.close()                                       # release file handle
 
     now = now_ist()
     rows = [(plan_id, d, util_pct, now, created_by) for d, util_pct in daily]

@@ -29,14 +29,20 @@ def _round_sku_totals_up_to_even(rows: list[tuple]) -> int:
     for i, r in enumerate(rows):
         sku = r[_SKU_IDX]
         qty = r[_QTY_IDX] or 0
-        if not sku or qty == 0:        # skip CHANGEOVER / cleaning rows
-            continue
+        if not sku:
+            continue                              # truly empty rows
+        if str(sku).upper() == "CHANGEOVER":
+            continue                              # never a producible SKU
+        # Real SKUs WITH qty=0 are still tracked so totals dict matches DB SUM(qty).
         sku_total[sku] = sku_total.get(sku, 0) + int(qty)
         sku_first.setdefault(sku, i)
 
+    # Use the SAME helper kpi_writer uses, so both writers agree on "evenness".
+    from V1.reports.kpi_writer import _round_up_to_even
     bumped = 0
     for sku, total in sku_total.items():
-        if total % 2 == 1:
+        even_total = _round_up_to_even(total)
+        if even_total != total:                 # was odd → bump first slot by +1
             i = sku_first[sku]
             row = list(rows[i])
             row[_QTY_IDX] = (row[_QTY_IDX] or 0) + 1
@@ -70,32 +76,35 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     sku_desc_lookup = _load_sku_descriptions(plan_id, db_cfg)
 
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
-    ws = wb["Shift Schedule"]
-    now = now_ist()
+    try:
+        ws = wb["Shift Schedule"]
+        now = now_ist()
 
-    rows = []
-    # Shift Schedule columns (v4): Date, Shift, Machine, SKUCode, StartTime,
-    # EndTime, Qty, CycleTime_min, GT_Inventory, Remarks. Description is gone.
-    for r in range(4, ws.max_row + 1):
-        date_v, shift_v, _machine, sku_code, start_t, end_t, qty, cycle, _gt, remarks = (
-            ws.cell(row=r, column=c).value for c in range(1, 11)
-        )
-        if all(v is None for v in (date_v, shift_v, sku_code, start_t, end_t, qty)):
-            continue
-        rows.append((
-            plan_id,
-            sku_code,
-            sku_desc_lookup.get(sku_code),   # populated from jkt_demand
-            date_v.date() if hasattr(date_v, "date") else date_v,
-            shift_v,
-            start_t,
-            end_t,
-            int(qty) if qty is not None else None,
-            float(cycle) if cycle is not None else None,
-            remarks,
-            now,
-            created_by,
-        ))
+        rows = []
+        # Shift Schedule columns (v4): Date, Shift, Machine, SKUCode, StartTime,
+        # EndTime, Qty, CycleTime_min, GT_Inventory, Remarks. Description is gone.
+        for r in range(4, ws.max_row + 1):
+            date_v, shift_v, _machine, sku_code, start_t, end_t, qty, cycle, _gt, remarks = (
+                ws.cell(row=r, column=c).value for c in range(1, 11)
+            )
+            if all(v is None for v in (date_v, shift_v, sku_code, start_t, end_t, qty)):
+                continue
+            rows.append((
+                plan_id,
+                sku_code,
+                sku_desc_lookup.get(sku_code),   # populated from jkt_demand
+                date_v.date() if hasattr(date_v, "date") else date_v,
+                shift_v,
+                start_t,
+                end_t,
+                int(qty) if qty is not None else None,
+                float(cycle) if cycle is not None else None,
+                remarks,
+                now,
+                created_by,
+            ))
+    finally:
+        wb.close()                                       # release file handle
 
     # Plant constraint: per-SKU planned qty must be EVEN. Add +1 tyre on the
     # first slot of any SKU whose total is odd.
