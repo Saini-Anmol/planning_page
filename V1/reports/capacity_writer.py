@@ -15,7 +15,7 @@ from pathlib import Path
 import openpyxl
 
 from V1.setups import plan_params
-from V1.utilities.db import connect
+from V1.utilities.db import connect, safe_table
 from V1.utilities.exceptions import PipelineError
 from V1.utilities.time_utils import now_ist
 
@@ -86,8 +86,14 @@ def compute_daily_utilisation(wb, plan_start, plan_end) -> list[tuple]:
     return result
 
 
-def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
-    plan_row = plan_params.fetch(db_cfg, plan_id)
+def upload(
+    schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict,
+    tables: dict | None = None,
+) -> None:
+    tables         = tables or {}
+    params_table   = tables.get("plan_params", "jkt_plan_params")
+    capacity_table = safe_table(tables.get("capacity", "jkt_plan_capacityUtilisation"))
+    plan_row = plan_params.fetch(db_cfg, plan_id, params_table)
     plan_start = plan_row["planStartDate"]
     plan_end   = plan_row["planEndDate"]
     if isinstance(plan_start, datetime): plan_start = plan_start.date()
@@ -108,13 +114,13 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
         cur = conn.cursor()
         # NOTE: actual DB column is `creatdBy` (typo), not `createdBy`.
         cur.executemany(
-            """INSERT INTO jkt_plan_capacityUtilisation
+            f"""INSERT INTO {capacity_table}
                    (plan_id, date, capacityUtilisation, createdAt, creatdBy)
                VALUES (%s, %s, %s, %s, %s)""",
             rows,
         )
         conn.commit()
-        print(f"[upload:capacity] inserted {cur.rowcount} rows into jkt_plan_capacityUtilisation")
+        print(f"[upload:capacity] inserted {cur.rowcount} rows into {capacity_table}")
     finally:
         cur.close()
         conn.close()

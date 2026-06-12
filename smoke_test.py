@@ -343,6 +343,110 @@ def _():
     assert hasattr(cw, "plan_params"), "capacity_writer should import plan_params"
 
 
+@check("schedule_route: _DEFAULT_CT_MIN constant + _post_process_schedule_excel function exist")
+def _():
+    """Verify the new cycle-time default + Excel post-process are wired in."""
+    from V1.routes import schedule_route as sr
+    assert hasattr(sr, "_DEFAULT_CT_MIN"), "missing _DEFAULT_CT_MIN constant"
+    assert sr._DEFAULT_CT_MIN == 15.0, f"default CT should be 15, got {sr._DEFAULT_CT_MIN}"
+    assert callable(getattr(sr, "_post_process_schedule_excel", None)), \
+        "missing _post_process_schedule_excel(path, default_ct_skus)"
+
+
+@check("schedule_route: post-process Excel excludes CO+clean AND sets 'NA' for default CT SKUs")
+def _():
+    """Build a tiny synthetic schedule Excel and run the post-process on it."""
+    import openpyxl, tempfile, os
+    from datetime import datetime
+    from V1.routes.schedule_route import _post_process_schedule_excel
+    wb = openpyxl.Workbook()
+    # Demand Fulfillment sheet
+    ws = wb.active; ws.title = "Demand Fulfillment"
+    ws.append(["title"]); ws.append(["summary"])
+    ws.append(["SKUCode","Priority","Demand","GT","Planned_Units","Gap","Fulfillment_Pct","Status","CycleTime_min"])
+    ws.append(["SKU_REAL",   0.5, 100, 0, 100, 0, 1.0, "FULLY MET", 17])
+    ws.append(["SKU_DEFAULT",0.5, 100, 0, 100, 0, 1.0, "FULLY MET", 15])
+    # Shift Schedule
+    ws2 = wb.create_sheet("Shift Schedule")
+    ws2.append(["title"]); ws2.append(["summary"])
+    ws2.append(["Date","Shift","Machine","SKUCode","StartTime","EndTime","Qty","CT","GT","Remarks"])
+    ws2.append([datetime(2026,6,1), "A", "1234", "SKU_REAL",   datetime(2026,6,1,7), datetime(2026,6,1,15), 30, 16, 0, "LP Scheduled"])
+    ws2.append([datetime(2026,6,1), "B", "1234", "CHANGEOVER", datetime(2026,6,1,15),datetime(2026,6,1,20), 0,  0, 0, "C/O"])
+    ws2.append([datetime(2026,6,1), "B", "1234", "SKU_REAL",   datetime(2026,6,1,20),datetime(2026,6,1,22), 10, 12, 0, "Mould Cleaning"])
+    # Machine Utilization
+    ws3 = wb.create_sheet("Machine Utilization")
+    ws3.append(["title"]); ws3.append(["summary"])
+    ws3.append(["Machine","Avail","Used","Idle","Util","SKUs","Cycles","Units"])
+    ws3.append([1234, 1440, 900, 540, 0.625, 1, 25, 50])
+    # Machine Schedule (post-process will rewrite this)
+    ws4 = wb.create_sheet("Machine Schedule")
+    ws4.append(["title"]); ws4.append(["summary"])
+    ws4.append(["Machine","SKUCode","Priority","CycleTime_min","Cycles","Units_Planned","Mins_Used","Days_Used"])
+    ws4.append([1234, "SKU_REAL", 0.5, 17, 5, 10, 80, 0.06])  # legacy stub; will be rebuilt
+
+    f = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); f.close()
+    wb.save(f.name); wb.close()
+    _post_process_schedule_excel(f.name, {"SKU_DEFAULT"})
+
+    wb2 = openpyxl.load_workbook(f.name, data_only=True)
+    # Check NA was applied
+    assert wb2["Demand Fulfillment"].cell(row=4, column=9).value == 17,   "real SKU's CT should stay 17"
+    assert wb2["Demand Fulfillment"].cell(row=5, column=9).value == "NA","defaulted SKU should show NA"
+    # Check Machine Utilization Used_Mins = 480 production only (excluded 300 CO + 120 clean)
+    assert wb2["Machine Utilization"].cell(row=4, column=3).value == 480, \
+        f"Used should be 480 (productive only), got {wb2['Machine Utilization'].cell(row=4, column=3).value}"
+    # Machine Schedule was rebuilt: only the productive row counts (Mould Cleaning row excluded)
+    ws_m = wb2["Machine Schedule"]
+    found = False
+    for r in range(4, ws_m.max_row + 1):
+        m_val = ws_m.cell(row=r, column=1).value
+        if str(m_val) == "1234" and ws_m.cell(row=r, column=2).value == "SKU_REAL":
+            assert ws_m.cell(row=r, column=6).value == 30, \
+                f"Units_Planned should = 30 (only productive row; clean+CO excluded), got {ws_m.cell(row=r, column=6).value}"
+            found = True
+    assert found, "rebuilt Machine Schedule row missing for (1234, SKU_REAL)"
+    wb2.close(); os.unlink(f.name)
+
+
+@check("schedule_route: Machine Schedule reconciles with Shift Schedule across multi-run SKUs")
+def _():
+    """Three productive runs on the same machine for the same SKU should
+    aggregate to one row totaling 80 units (legacy LP would have shown only
+    the first-pass 30; rebuild fixes this)."""
+    import openpyxl, tempfile, os
+    from datetime import datetime
+    from V1.routes.schedule_route import _post_process_schedule_excel
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Demand Fulfillment"
+    ws.append(["t"]); ws.append(["s"])
+    ws.append(["SKUCode","Priority","Demand","GT","Planned_Units","Gap","Fulfillment_Pct","Status","CycleTime_min"])
+    ws.append(["SKU_A", 0.9, 80, 0, 80, 0, 1.0, "FULLY MET", 18])
+    ws2 = wb.create_sheet("Shift Schedule")
+    ws2.append(["t"]); ws2.append(["s"])
+    ws2.append(["Date","Shift","Machine","SKUCode","StartTime","EndTime","Qty","CT","GT","Remarks"])
+    ws2.append([datetime(2026,6,1),"A","5555","SKU_A",datetime(2026,6,1,7),datetime(2026,6,1,12),30,18,0,"LP"])
+    ws2.append([datetime(2026,6,2),"A","5555","SKU_A",datetime(2026,6,2,7),datetime(2026,6,2,12),30,18,0,"continuity"])
+    ws2.append([datetime(2026,6,3),"A","5555","SKU_A",datetime(2026,6,3,7),datetime(2026,6,3,9),20,18,0,"extra run"])
+    ws3 = wb.create_sheet("Machine Utilization")
+    ws3.append(["t"]); ws3.append(["s"])
+    ws3.append(["Machine","Avail","Used","Idle","Util","SKUs","Cycles","Units"])
+    ws3.append([5555, 1440, 100, 1340, 0.07, 1, 50, 100])
+    ws4 = wb.create_sheet("Machine Schedule")
+    ws4.append(["t"]); ws4.append(["s"])
+    ws4.append(["Machine","SKUCode","Priority","CycleTime_min","Cycles","Units_Planned","Mins_Used","Days_Used"])
+    ws4.append([5555, "SKU_A", 0.9, 18, 15, 30, 270, 0.19])  # buggy first-pass: only 30
+
+    f = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); f.close()
+    wb.save(f.name); wb.close()
+    _post_process_schedule_excel(f.name, set())
+
+    wb2 = openpyxl.load_workbook(f.name, data_only=True)
+    ws_m = wb2["Machine Schedule"]
+    total = sum(float(ws_m.cell(row=r, column=6).value or 0) for r in range(4, ws_m.max_row+1))
+    assert total == 80, f"Σ Units_Planned should = 80 (multi-run aggregated), got {total}"
+    wb2.close(); os.unlink(f.name)
+
+
 @check("schedule_route: DB overrides for noOfChangeOver + efficiency are wired in")
 def _():
     """Verify the new DB-override block exists in _run_locked()."""

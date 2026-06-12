@@ -6,7 +6,7 @@ from pathlib import Path
 
 import openpyxl
 
-from V1.utilities.db import connect
+from V1.utilities.db import connect, safe_table
 from V1.utilities.time_utils import now_ist
 
 _BATCH = 1000
@@ -51,18 +51,21 @@ def _round_sku_totals_up_to_even(rows: list[tuple]) -> int:
     return bumped
 
 
-def _load_sku_descriptions(plan_id: str, db_cfg: dict) -> dict[str, str]:
-    """Build a SKUCode → description lookup from jkt_demand.
+def _load_sku_descriptions(
+    plan_id: str, db_cfg: dict, demand_table: str = "jkt_demand"
+) -> dict[str, str]:
+    """Build a SKUCode → description lookup from the demand table.
 
     The v4 scheduler dropped SKU_Description from the Shift Schedule sheet,
     so we enrich from the demand table (which has it). CHANGEOVER rows and
-    any SKU not in jkt_demand simply get None.
+    any SKU not in the demand table simply get None.
     """
+    demand_table = safe_table(demand_table)
     conn = connect(db_cfg)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT skuCode, MAX(skuDescription) FROM jkt_demand "
+            f"SELECT skuCode, MAX(skuDescription) FROM {demand_table} "
             "WHERE plan_id = %s GROUP BY skuCode",
             (plan_id,),
         )
@@ -72,8 +75,14 @@ def _load_sku_descriptions(plan_id: str, db_cfg: dict) -> dict[str, str]:
         conn.close()
 
 
-def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
-    sku_desc_lookup = _load_sku_descriptions(plan_id, db_cfg)
+def upload(
+    schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict,
+    tables: dict | None = None,
+) -> None:
+    tables          = tables or {}
+    demand_table    = tables.get("demand", "jkt_demand")
+    plan_table      = safe_table(tables.get("plan", "jkt_plan"))
+    sku_desc_lookup = _load_sku_descriptions(plan_id, db_cfg, demand_table)
 
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
     try:
@@ -118,7 +127,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
         total = 0
         for i in range(0, len(rows), _BATCH):
             cur.executemany(
-                """INSERT INTO jkt_plan
+                f"""INSERT INTO {plan_table}
                        (plan_id, skuCode, skuDescription, date, shift,
                         startTime, endTime, qty, cycleTime, remarks, createdAt, createdBy)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -126,7 +135,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
             )
             total += cur.rowcount
         conn.commit()
-        print(f"[upload:plan] inserted {total} rows into jkt_plan")
+        print(f"[upload:plan] inserted {total} rows into {plan_table}")
     finally:
         cur.close()
         conn.close()

@@ -9,7 +9,7 @@ import openpyxl
 
 from V1.reports.capacity_writer import compute_daily_utilisation
 from V1.setups import plan_params
-from V1.utilities.db import connect
+from V1.utilities.db import connect, safe_table
 from V1.utilities.time_utils import now_ist
 
 
@@ -58,13 +58,14 @@ def _count_planned_skus(ws) -> int:
     return n
 
 
-def _count_demand_skus(plan_id: str, db_cfg: dict) -> int:
-    """Distinct SKUs requested in jkt_demand for this plan."""
+def _count_demand_skus(plan_id: str, db_cfg: dict, demand_table: str = "jkt_demand") -> int:
+    """Distinct SKUs requested in the demand table for this plan."""
+    demand_table = safe_table(demand_table)
     conn = connect(db_cfg)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(DISTINCT skuCode) FROM jkt_demand WHERE plan_id = %s",
+            f"SELECT COUNT(DISTINCT skuCode) FROM {demand_table} WHERE plan_id = %s",
             (plan_id,),
         )
         return int(cur.fetchone()[0])
@@ -127,10 +128,12 @@ def _demand_weighted_fulfillment(ws) -> float:
     return round(weighted / total_demand * 100, 2)
 
 
-def _overall_capacity_utilisation(wb, plan_id: str, db_cfg: dict) -> float:
+def _overall_capacity_utilisation(
+    wb, plan_id: str, db_cfg: dict, plan_params_table: str = "jkt_plan_params"
+) -> float:
     """Mean of the per-date fleet utilisations — same full-day (1440 min) math
     the capacity_writer uses, so the KPI matches jkt_plan_capacityUtilisation."""
-    plan_row = plan_params.fetch(db_cfg, plan_id)
+    plan_row = plan_params.fetch(db_cfg, plan_id, plan_params_table)
     ps, pe = plan_row["planStartDate"], plan_row["planEndDate"]
     if isinstance(ps, datetime): ps = ps.date()
     if isinstance(pe, datetime): pe = pe.date()
@@ -140,13 +143,21 @@ def _overall_capacity_utilisation(wb, plan_id: str, db_cfg: dict) -> float:
     return round(sum(u for _, u in daily) / len(daily), 2)
 
 
-def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> None:
+def upload(
+    schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict,
+    tables: dict | None = None,
+) -> None:
+    tables       = tables or {}
+    demand_table = safe_table(tables.get("demand", "jkt_demand"))
+    params_table = tables.get("plan_params", "jkt_plan_params")
+    kpis_table   = safe_table(tables.get("plan_kpis", "jkt_plan_kpis"))
+
     wb = openpyxl.load_workbook(schedule_path, data_only=True)
     try:
         ws = wb["Demand Fulfillment"]
         summary = ws.cell(row=2, column=1).value or ""
 
-        demand_sku = _count_demand_skus(plan_id, db_cfg)
+        demand_sku = _count_demand_skus(plan_id, db_cfg, demand_table)
         plan_sku   = _count_planned_skus(ws)
 
         row = {
@@ -154,7 +165,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
             "demandFulfillment":   _demand_weighted_fulfillment(ws),
             "demandSKU":           demand_sku,
             "planSKU":             plan_sku,
-            "capacityUtilisation": _overall_capacity_utilisation(wb, plan_id, db_cfg),
+            "capacityUtilisation": _overall_capacity_utilisation(wb, plan_id, db_cfg, params_table),
             "curingChangeovers":   int(_require(r"Changeovers:\s*([\d,]+)", summary).replace(",", "")),
             "createdAt":           now_ist(),
             "createdBy":           created_by,
@@ -166,7 +177,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
     try:
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO jkt_plan_kpis
+            f"""INSERT INTO {kpis_table}
                    (plan_id, demandFulfillment, demandSKU, planSKU,
                     capacityUtilisation, curingChangeovers, createdAt, createdBy)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -174,7 +185,7 @@ def upload(schedule_path: Path, plan_id: str, created_by: str, db_cfg: dict) -> 
              row["capacityUtilisation"], row["curingChangeovers"], row["createdAt"], row["createdBy"]),
         )
         conn.commit()
-        print(f"[upload:kpi] inserted 1 row into jkt_plan_kpis")
+        print(f"[upload:kpi] inserted 1 row into {kpis_table}")
     finally:
         cur.close()
         conn.close()

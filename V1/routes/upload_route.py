@@ -17,7 +17,8 @@ from V1.utilities.exceptions import PipelineError
 def _resolve_schedule_path(cfg: dict) -> Path:
     """The scheduler writes PCR_Schedule_<plan_id>_<plan_start>_<n>days.xlsx into output/."""
     plan_id = cfg["plan"]["plan_id"]
-    plan_row = plan_params.fetch(cfg["db"], plan_id)
+    tbl = cfg.get("tbl", {})
+    plan_row = plan_params.fetch(cfg["db"], plan_id, tbl.get("plan_params", "jkt_plan_params"))
     import datetime as _dt
     ps = plan_row["planStartDate"]
     pe = plan_row["planEndDate"]
@@ -34,6 +35,7 @@ def run(cfg: dict, schedule_path: Path | None = None) -> None:
     plan_id    = cfg["plan"]["plan_id"]
     created_by = cfg["upload"]["created_by"]
     db_cfg     = cfg["db"]
+    tbl        = cfg.get("tbl", {})
     path       = schedule_path or _resolve_schedule_path(cfg)
 
     if not path.exists():
@@ -43,6 +45,6 @@ def run(cfg: dict, schedule_path: Path | None = None) -> None:
         )
 
     print(f"[upload] reading {path.name}")
-    kpi_writer.upload(path, plan_id, created_by, db_cfg)
-    plan_writer.upload(path, plan_id, created_by, db_cfg)
-    capacity_writer.upload(path, plan_id, created_by, db_cfg)
+    kpi_writer.upload(path, plan_id, created_by, db_cfg, tbl)
+    plan_writer.upload(path, plan_id, created_by, db_cfg, tbl)
+    capacity_writer.upload(path, plan_id, created_by, db_cfg, tbl)

@@ -57,13 +57,55 @@ def _apply_db_env_overrides(cfg: dict) -> None:
         cfg["db"][cfg_key] = int(val) if cfg_key == "port" else val
 
 
-def load(path: Path | str | None = None) -> dict:
-    """Load YAML config from disk + apply env-var overrides for DB creds."""
+DEFAULT_MODE = "planning"
+
+
+def apply_mode(cfg: dict, mode: str = DEFAULT_MODE) -> dict:
+    """Resolve logical table names into physical ones for the given mode.
+
+    Sets cfg["mode"] and cfg["tbl"] = {logical_name -> physical_table_name}.
+    Modules read cfg["tbl"]["demand"] etc. instead of hardcoding "jkt_demand",
+    so the same pipeline can run against jkt_* (planning) or jkt_sim_* (simulation).
+
+    The mode token is inserted right after a leading "jkt_":
+        planning   -> jkt_demand        simulation -> jkt_sim_demand
+    """
+    from V1.utilities.db import safe_table
+
+    tables = cfg.get("tables", {})
+    tokens = tables.get("mode_token", {})
+    if mode not in tokens:
+        raise ValueError(
+            f"unknown mode {mode!r}; expected one of {sorted(tokens)}"
+        )
+    token = tokens[mode] or ""
+
+    resolved: dict[str, str] = {}
+    for logical, base in tables.items():
+        if logical == "mode_token":
+            continue
+        if token and base.startswith("jkt_"):
+            physical = "jkt_" + token + base[len("jkt_"):]
+        else:
+            physical = base
+        resolved[logical] = safe_table(physical)
+
+    cfg["mode"] = mode
+    cfg["tbl"] = resolved
+    return cfg
+
+
+def load(path: Path | str | None = None, mode: str = DEFAULT_MODE) -> dict:
+    """Load YAML config from disk + apply env-var overrides for DB creds.
+
+    Also resolves table names for `mode` (default "planning") into cfg["tbl"].
+    """
     _load_dotenv_if_present()
     p = Path(path) if path else DEFAULT_CONFIG_PATH
     with open(p) as f:
         cfg = yaml.safe_load(f) or {}
     _apply_db_env_overrides(cfg)
+    apply_mode(cfg, mode)
     return cfg
 
 

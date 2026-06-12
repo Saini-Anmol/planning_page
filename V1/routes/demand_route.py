@@ -130,9 +130,10 @@ def _write_output(rows: list[dict], path: Path, sheet_name: str) -> None:
 
 def run(cfg: dict) -> Path:
     plan_id  = cfg["plan"]["plan_id"]
+    tbl      = cfg.get("tbl", {})
     out_path = config_loader.output_dir(cfg) / cfg["demand"]["output_excel"]
 
-    plan_row = plan_params.fetch(cfg["db"], plan_id)
+    plan_row = plan_params.fetch(cfg["db"], plan_id, tbl.get("plan_params", "jkt_plan_params"))
     print(f"[demand] plan={plan_id}  start={plan_row.get('planStartDate')}  "
           f"end={plan_row.get('planEndDate')}  "
           f"weights(m/q/d)={plan_row.get('marketWeightage')}/"
@@ -142,13 +143,14 @@ def run(cfg: dict) -> Path:
     print(f"[demand] renormalized weights: "
           f"({weights[0]:.4f}, {weights[1]:.4f}, {weights[2]:.4f})")
 
-    rows = demand_db.load(cfg["db"], plan_id)
+    demand_table = tbl.get("demand", "jkt_demand")
+    rows = demand_db.load(cfg["db"], plan_id, demand_table)
     if not rows:
         raise PipelineError(
-            f"No demand rows in jkt_demand for plan_id={plan_id!r}",
+            f"No demand rows in {demand_table} for plan_id={plan_id!r}",
             stage="demand", status_code=404,
         )
-    print(f"[demand] loaded {len(rows)} demand rows from jkt_demand")
+    print(f"[demand] loaded {len(rows)} demand rows from {demand_table}")
 
     smin = int(cfg["demand"]["market_score_scale"]["min"])
     smax = int(cfg["demand"]["market_score_scale"]["max"])

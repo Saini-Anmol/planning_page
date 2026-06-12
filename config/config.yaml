@@ -22,6 +22,31 @@ paths:
   output_dir: output
 
 # -------------------------------------------------------------------------
+# Table-name resolution — the SAME pipeline serves two frontend pages:
+#   • planning page    -> jkt_*      tables
+#   • simulation page  -> jkt_sim_*  tables  (identical schema, different names)
+# The mode is chosen by the API route (see api_route.py); planning is the
+# default for the CLI / tests. Master / reference tables (Master_*,
+# gt_inventory_manual, Daily_Running_Moulds) are SHARED across both modes and
+# are intentionally NOT listed here.
+#
+# `mode_token` is inserted right after the leading "jkt_":
+#   planning   -> jkt_demand          simulation -> jkt_sim_demand
+# -------------------------------------------------------------------------
+tables:
+  # logical name -> base (planning) table name
+  demand:        jkt_demand
+  plan_params:   jkt_plan_params
+  plan_kpis:     jkt_plan_kpis
+  plan:          jkt_plan
+  capacity:      jkt_plan_capacityUtilisation
+  infeasibility: jkt_plan_Infeasibility     # reserved — not written yet
+  history:       jkt_plan_history           # reserved — not written yet
+  mode_token:
+    planning:   ""
+    simulation: "sim_"
+
+# -------------------------------------------------------------------------
 # Phase A — demand extract (compute ConsolidatedPriorityScore)
 # -------------------------------------------------------------------------
 demand:

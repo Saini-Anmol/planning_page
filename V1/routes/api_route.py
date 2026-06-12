@@ -36,7 +36,8 @@ from V1.utilities.exceptions import PipelineError
 API_HOST            = "35.208.174.2"                       # public host for prod
 API_PORT            = 5001
 API_URL_PREFIX      = "/app/v1/jkt/planning-scheduling"
-API_GENERATE_PATH   = "/plan/generate-plan"
+API_GENERATE_PATH   = "/plan/generate-plan"              # planning page  -> jkt_*      tables
+API_SIMULATE_PATH   = "/simulation/generate-plan"        # simulation page -> jkt_sim_* tables
 API_HEALTH_PATH     = "/health"
 
 # Convenience: the literal URL strings other code or docs can reference.
@@ -73,21 +74,26 @@ def _extract_plan_id(req) -> tuple[str | None, str | None]:
     return plan_id, None
 
 
-@bp.route(API_GENERATE_PATH, methods=["POST"])
-def generate_plan():
+def _generate(mode: str):
+    """Shared A→B→C pipeline. `mode` ("planning" | "simulation") selects which
+    set of DB tables the run reads from and writes to (jkt_* vs jkt_sim_*).
+    Both routes funnel here so the two frontend pages share one code path."""
     plan_id, err = _extract_plan_id(request)
     if err:
         return jsonify({"status": "error", "stage": "validation", "message": err}), 400
 
-    cfg = config_loader.load()
+    cfg = config_loader.load(mode=mode)
     cfg["plan"]["plan_id"] = plan_id
     cfg = config_loader.resolve_paths(cfg)
+
+    # Output tables for the duplicate check, resolved for this mode.
+    output_tables = (cfg["tbl"]["plan_kpis"], cfg["tbl"]["plan"], cfg["tbl"]["capacity"])
 
     t0 = time.time()
     stage = "init"
     try:
         stage = "duplicate_check"
-        plan_status.assert_not_already_scheduled(cfg["db"], plan_id)
+        plan_status.assert_not_already_scheduled(cfg["db"], plan_id, output_tables)
 
         stage = "demand"
         demand_route.run(cfg)
@@ -101,6 +107,7 @@ def generate_plan():
         return jsonify({
             "status":  "error",
             "stage":   e.stage or stage,
+            "mode":    mode,
             "plan_id": plan_id,
             "message": str(e),
         }), e.status_code
@@ -108,6 +115,7 @@ def generate_plan():
         return jsonify({
             "status":  "error",
             "stage":   stage,
+            "mode":    mode,
             "plan_id": plan_id,
             "message": str(e),
             "trace":   traceback.format_exc().splitlines()[-6:],
@@ -115,9 +123,22 @@ def generate_plan():
 
     return jsonify({
         "status":           "success",
+        "mode":             mode,
         "plan_id":          plan_id,
         "elapsed_seconds":  round(time.time() - t0, 2),
     })
+
+
+@bp.route(API_GENERATE_PATH, methods=["POST"])
+def generate_plan():
+    """Planning page — reads/writes jkt_* tables."""
+    return _generate("planning")
+
+
+@bp.route(API_SIMULATE_PATH, methods=["POST"])
+def generate_simulation():
+    """Simulation page — reads/writes jkt_sim_* tables (same pipeline)."""
+    return _generate("simulation")
 
 
 @bp.route(API_HEALTH_PATH, methods=["GET"])

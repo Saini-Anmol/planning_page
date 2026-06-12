@@ -82,6 +82,10 @@ class Config:
     # from that row at runtime and override PLAN_DATE / PLANNING_DAYS below.
     PLAN_ID = "BTP_June_Plan_V_384072"
 
+    # Plan-params table name. Defaults to the planning table; _run_locked()
+    # overrides it to jkt_sim_plan_params for simulation-mode runs.
+    PLAN_PARAMS_TABLE = "jkt_plan_params"
+
     # ── planning horizon ──────────────────────────────────────────────────────
     PLANNING_DAYS    = 31
     SHIFTS_PER_DAY   = 3
@@ -1567,6 +1571,168 @@ def run_from_excel(
     return results
 
 
+_DEFAULT_CT_MIN = 15.0          # default cycle time (min) for SKUs missing in master
+
+
+def _post_process_schedule_excel(path: str, default_ct_skus: set) -> None:
+    """Two corrections applied to the schedule output Excel after the LP runs:
+
+    1. Machine Utilization sheet — Used_Mins, Idle_Mins, Utilization_Pct, etc.
+       are recomputed EXCLUDING CHANGEOVER + mould-clean rows. The headline
+       summary line in R2 is also rewritten. Matches the productive-util
+       definition we use everywhere else.
+
+    2. CycleTime_min column on the Demand Fulfillment sheet shows "NA" for any
+       SKU that received the default cycle time of 15 min (i.e. the SKU had no
+       row in Master_Curing_Design_CycleTime). The LP used 15 internally for
+       scheduling, but the user-facing report makes the missing-data status
+       explicit.
+    """
+    import openpyxl
+    from collections import defaultdict
+
+    wb = openpyxl.load_workbook(path, data_only=False)
+    try:
+        # ---------- (1) Machine Utilization — exclude CO / clean ----------
+        ws_s = wb["Shift Schedule"]
+        used_min:    dict = defaultdict(float)
+        skus_set:    dict = defaultdict(set)
+        cycles_cnt:  dict = defaultdict(float)   # productive cycles only
+        units_cnt:   dict = defaultdict(float)
+        for r in range(4, ws_s.max_row + 1):
+            machine = ws_s.cell(row=r, column=3).value
+            sku     = ws_s.cell(row=r, column=4).value
+            s       = ws_s.cell(row=r, column=5).value
+            e       = ws_s.cell(row=r, column=6).value
+            qty     = ws_s.cell(row=r, column=7).value or 0
+            ct      = ws_s.cell(row=r, column=8).value
+            remarks = (ws_s.cell(row=r, column=10).value or "")
+            if machine is None or s is None or e is None or e <= s:
+                continue
+            sku_u, rem_u = (str(sku).upper() if sku else ""), str(remarks).upper()
+            if sku_u == "CHANGEOVER" or "CLEAN" in rem_u or "CHANGEOVER" in rem_u:
+                continue                            # productive only
+            # IMPORTANT: Shift Schedule uses both int and str machine IDs in the
+            # same column; Machine Utilization uses all int. Coerce to str on
+            # both sides to make the lookup match (same trick as capacity_writer).
+            m_key = str(machine)
+            mins = (e - s).total_seconds() / 60
+            used_min[m_key]   += mins
+            skus_set[m_key].add(sku)
+            units_cnt[m_key]  += float(qty or 0)
+            try:
+                if ct: cycles_cnt[m_key] += float(qty) / 2.0   # 2 tyres/cycle
+            except (TypeError, ValueError):
+                pass
+
+        ws_u = wb["Machine Utilization"]
+        avail_per_mach = None
+        utils = []
+        high  = 0; idle  = 0; total = 0
+        for r in range(4, ws_u.max_row + 1):
+            m = ws_u.cell(row=r, column=1).value
+            if m is None: continue
+            avail = ws_u.cell(row=r, column=2).value or 0
+            avail_per_mach = avail
+            m_key = str(m)                                    # match Shift-Schedule keys
+            u = used_min.get(m_key, 0.0)
+            i = max(0.0, avail - u)
+            util = (u / avail) if avail else 0.0
+            ws_u.cell(row=r, column=3).value = round(u, 0)
+            ws_u.cell(row=r, column=4).value = round(i, 0)
+            ws_u.cell(row=r, column=5).value = round(util, 3)
+            ws_u.cell(row=r, column=6).value = len(skus_set.get(m_key, set()))
+            ws_u.cell(row=r, column=7).value = round(cycles_cnt.get(m_key, 0), 0)
+            ws_u.cell(row=r, column=8).value = round(units_cnt.get(m_key, 0), 0)
+            utils.append(util); total += 1
+            if util >= 0.90: high += 1
+            if util == 0.0:  idle += 1
+        avg_util = (sum(utils) / total * 100) if total else 0.0
+        ws_u.cell(row=2, column=1).value = (
+            f"Avg: {avg_util:.1f}% | High(≥90%): {high} | Idle: {idle} | Total: {total}"
+        )
+
+        # ---------- (2) Demand Fulfillment — "NA" for defaulted CT SKUs ----------
+        if default_ct_skus:
+            ws_df = wb["Demand Fulfillment"]
+            for r in range(4, ws_df.max_row + 1):
+                sku = ws_df.cell(row=r, column=1).value
+                if sku in default_ct_skus:
+                    ws_df.cell(row=r, column=9).value = "NA"      # CycleTime_min col
+
+        # ---------- (3) Machine Schedule — rebuild from Shift Schedule ----------
+        # Bug: the legacy df_mach only captures the LP rounder's FIRST-PASS
+        # allocation. The ScheduleBuilder then adds continuity rows + extra
+        # runs that don't propagate back. Result: Σ Units_Planned in this
+        # sheet ≠ Σ Qty in Shift Schedule ≠ Σ Planned_Units in Demand
+        # Fulfillment. Fix: re-derive (Machine, SKU) totals from Shift
+        # Schedule (the authoritative final schedule).
+        from collections import defaultdict as _dd
+        units_by_pair: dict = _dd(float)      # (machine, sku) → Σ Qty
+        mins_by_pair:  dict = _dd(float)      # (machine, sku) → Σ elapsed min
+        ct_by_pair:    dict = {}              # first non-null CT seen
+        for r in range(4, ws_s.max_row + 1):
+            machine = ws_s.cell(row=r, column=3).value
+            sku     = ws_s.cell(row=r, column=4).value
+            s       = ws_s.cell(row=r, column=5).value
+            e       = ws_s.cell(row=r, column=6).value
+            qty     = ws_s.cell(row=r, column=7).value or 0
+            ct      = ws_s.cell(row=r, column=8).value
+            remarks = (ws_s.cell(row=r, column=10).value or "")
+            if not (machine and sku and s and e and e > s): continue
+            sku_u, rem_u = str(sku).upper(), str(remarks).upper()
+            if sku_u == "CHANGEOVER" or sku_u == "MOULD_CLEAN" \
+               or "CLEAN" in rem_u or "CHANGEOVER" in rem_u:
+                continue                                # productive only
+            key = (machine, sku)
+            units_by_pair[key] += float(qty)
+            mins_by_pair[key]  += (e - s).total_seconds() / 60
+            if key not in ct_by_pair and ct: ct_by_pair[key] = ct
+
+        # Per-SKU priority from Demand Fulfillment (col 2 = Priority).
+        ws_df = wb["Demand Fulfillment"]
+        prio_by_sku: dict = {}
+        for r in range(4, ws_df.max_row + 1):
+            sku = ws_df.cell(row=r, column=1).value
+            if sku: prio_by_sku[sku] = ws_df.cell(row=r, column=2).value
+
+        # Wipe old Machine Schedule rows and rewrite.
+        ws_m = wb["Machine Schedule"]
+        # Columns: 1=Machine 2=SKUCode 3=Priority 4=CycleTime_min
+        #          5=Cycles 6=Units_Planned 7=Mins_Used 8=Days_Used
+        if ws_m.max_row > 3:
+            ws_m.delete_rows(4, ws_m.max_row - 3)
+
+        # Sort: machine asc, then by priority desc (high-priority SKUs first).
+        rows_sorted = sorted(units_by_pair.keys(),
+                             key=lambda k: (str(k[0]), -float(prio_by_sku.get(k[1], 0) or 0)))
+        SLOT_MIN_PER_DAY = 3 * 8 * 60                  # 3 shifts × 8h × 60
+        for i, (machine, sku) in enumerate(rows_sorted, start=4):
+            units = units_by_pair[(machine, sku)]
+            mins  = mins_by_pair[(machine, sku)]
+            ct    = ct_by_pair.get((machine, sku))
+            cycles = units / 2.0                       # 2 tyres/cycle
+            ws_m.cell(row=i, column=1).value = machine
+            ws_m.cell(row=i, column=2).value = sku
+            ws_m.cell(row=i, column=3).value = prio_by_sku.get(sku)
+            ws_m.cell(row=i, column=4).value = "NA" if sku in default_ct_skus else ct
+            ws_m.cell(row=i, column=5).value = round(cycles, 0)
+            ws_m.cell(row=i, column=6).value = round(units, 0)
+            ws_m.cell(row=i, column=7).value = round(mins, 1)
+            ws_m.cell(row=i, column=8).value = round(mins / SLOT_MIN_PER_DAY, 2)
+
+        # Update Machine Schedule R2 summary.
+        total_units = sum(units_by_pair.values())
+        ws_m.cell(row=2, column=1).value = (
+            f"Pairs: {len(units_by_pair)} | Σ Units: {int(total_units):,} | "
+            f"Σ Cycles: {int(total_units/2):,}"
+        )
+
+        wb.save(path)
+    finally:
+        wb.close()
+
+
 def run_from_database(
     plan_id:      str = None,
     demand_csv:   str = None,
@@ -1583,12 +1749,12 @@ def run_from_database(
     # Fetch plan params and override the date-dependent Config knobs.
     pid = plan_id or Config.PLAN_ID
     plan_params = pd.read_sql(
-        f"SELECT planStartDate, planEndDate FROM {Config.DB_NAME}.jkt_plan_params "
+        f"SELECT planStartDate, planEndDate FROM {Config.DB_NAME}.{Config.PLAN_PARAMS_TABLE} "
         f"WHERE plan_id = %(pid)s",
         engine, params={"pid": pid},
     )
     if plan_params.empty:
-        raise ValueError(f"plan_id={pid!r} not found in jkt_plan_params")
+        raise ValueError(f"plan_id={pid!r} not found in {Config.PLAN_PARAMS_TABLE}")
     ps_date = pd.to_datetime(plan_params.iloc[0]["planStartDate"]).date()
     pe_date = pd.to_datetime(plan_params.iloc[0]["planEndDate"]).date()
     plan_start = datetime(ps_date.year, ps_date.month, ps_date.day,
@@ -1613,6 +1779,20 @@ def run_from_database(
     df_running = etl.load_running_moulds()
     df_mould_m = etl.load_mould_master()
 
+    # ── Inject default cycle time (15 min) for demand SKUs missing in master ──
+    # These SKUs become schedulable; their CycleTime_min will display as "NA"
+    # in the final Excel via _post_process_schedule_excel.
+    have_ct      = set(df_cycles["SKUCode"].astype(str))
+    demand_skus  = set(df_demand["SKUCode"].astype(str))
+    missing_ct   = demand_skus - have_ct
+    if missing_ct:
+        extra = pd.DataFrame(
+            {"SKUCode": sorted(missing_ct), "CycleTime_min": _DEFAULT_CT_MIN}
+        )
+        df_cycles = pd.concat([df_cycles, extra], ignore_index=True)
+        print(f"[Phase 0] CT default applied to {len(missing_ct)} SKU(s) "
+              f"(cycle={_DEFAULT_CT_MIN} min — shown as 'NA' in output)")
+
     tracker = MouldTracker()
     tracker.load_from_df(df_mould_m, df_running)
 
@@ -1620,6 +1800,10 @@ def run_from_database(
     results   = scheduler.run(df_demand, df_cycles, df_allow, df_gt,
                               tracker, df_running, plan_start)
     ExcelExporter(output_path).export(results)
+
+    # Post-process the Excel: fix Machine Utilization (productive only) +
+    # show 'NA' for SKUs that received the default cycle time.
+    _post_process_schedule_excel(output_path, missing_ct)
     return results
 
 
@@ -1653,7 +1837,11 @@ def _run_locked(cfg: dict) -> dict:
 
     # Push scheduler knobs from YAML into the legacy Config class. Safe to
     # mutate global Config here because _RUN_LOCK serializes us.
+    from V1.utilities.db import safe_table
+    tbl = cfg.get("tbl", {})
+
     Config.PLAN_ID                   = plan_id
+    Config.PLAN_PARAMS_TABLE         = safe_table(tbl.get("plan_params", "jkt_plan_params"))
     Config.DB_SERVER                 = cfg["db"]["host"]
     Config.DB_NAME                   = cfg["db"]["database"]
     Config.DB_USER                   = cfg["db"]["user"]
@@ -1680,7 +1868,7 @@ def _run_locked(cfg: dict) -> dict:
     # we've fetched planStartDate. We pass output_path explicitly here.
     # For now we precompute it by re-doing the date lookup.
     from V1.setups import plan_params
-    plan_row = plan_params.fetch(cfg["db"], plan_id)
+    plan_row = plan_params.fetch(cfg["db"], plan_id, Config.PLAN_PARAMS_TABLE)
     import datetime as _dt
     ps_date = plan_row["planStartDate"]
     if isinstance(ps_date, _dt.datetime):

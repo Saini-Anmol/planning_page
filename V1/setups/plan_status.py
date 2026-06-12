@@ -9,19 +9,27 @@ plan_id, clean its rows out of the 3 target tables manually.
 """
 from __future__ import annotations
 
-from V1.utilities.db import connect
+from V1.utilities.db import connect, safe_table
 from V1.utilities.exceptions import PipelineError
 
 
 _OUTPUT_TABLES = ("jkt_plan_kpis", "jkt_plan", "jkt_plan_capacityUtilisation")
 
 
-def assert_not_already_scheduled(db_cfg: dict, plan_id: str) -> None:
-    """Raise PipelineError(409) if any output table already has rows for plan_id."""
+def assert_not_already_scheduled(
+    db_cfg: dict, plan_id: str, tables: tuple[str, ...] | None = None
+) -> None:
+    """Raise PipelineError(409) if any output table already has rows for plan_id.
+
+    `tables` lets the simulation pipeline check jkt_sim_* outputs instead of
+    the default jkt_* ones.
+    """
+    output_tables = tables or _OUTPUT_TABLES
     conn = connect(db_cfg)
     try:
         cur = conn.cursor()
-        for table in _OUTPUT_TABLES:
+        for table in output_tables:
+            table = safe_table(table)
             cur.execute(f"SELECT COUNT(*) FROM {table} WHERE plan_id = %s", (plan_id,))
             n = cur.fetchone()[0]
             if n > 0:
