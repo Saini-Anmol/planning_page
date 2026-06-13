@@ -13,7 +13,8 @@ the formulas below are what `V1/reports/*_writer.py` actually implements.
 5. [curingChangeovers](#5-curingchangeovers)
 6. [Press efficiency](#6-press-efficiency)
 7. [Even-tyre rule](#7-even-tyre-rule)
-8. [How everything fits together](#8-how-it-all-fits-together)
+8. [Infeasibility report](#8-infeasibility-report)
+9. [How everything fits together](#9-how-it-all-fits-together)
 
 ---
 
@@ -234,6 +235,8 @@ at  94% efficiency: (15 + 2.3) / 0.94 = 18.4 min/unit
 
 So at 94% efficiency each tyre occupies the press ~1.1 min longer. That extra time is counted as **productive busy** time (the press is occupied producing, just slower).
 
+> **This is the *only* place efficiency is used** — purely to inflate `CycleTime_min`. It is never a separate factor in the utilization denominator (always the flat 1440 min/day, see §4). SKUs missing from `Master_Curing_Design_CycleTime` are no exception: their default **15-min raw cure** is run through this exact formula → `(15 + 2.3) / 0.94 ≈ 18 min` (not a flat 15). They're flagged in the [infeasibility report](#8-infeasibility-report) (`defaultCycleTime=1`).
+
 ### Lower efficiency → HIGHER utilization
 
 Because efficiency lives in the **numerator** (it inflates busy minutes via cycle time), a *lower* efficiency makes the same production output consume *more* press-time → *higher* utilization.
@@ -273,7 +276,51 @@ Both writers use the **same** helper: `_round_up_to_even(n) = n + (n % 2)`. Defi
 
 ---
 
-## 8. How it all fits together
+## 8. Infeasibility report
+
+**What:** a per-SKU diagnostic table (`jkt_plan_Infeasibility`) listing every SKU
+whose demand was **not fully & cleanly met**, plus every SKU scheduled on an
+**assumed cycle time**. Written by `infeasibility_writer.upload()` in Phase C, from
+the Demand Fulfillment sheet. It answers "what fell short, and why" without opening
+the Excel. Unlike the rows above it is **not a single KPI** — it's one row per
+flagged SKU.
+
+A SKU is recorded if **either** condition holds:
+
+| Condition | Detected from | Example `reason` |
+|---|---|---|
+| **Demand shortfall** — even-rounded `Planned_Units` < `Demand` (Status `PARTIAL` / `UNMET` / `UNSCHEDULABLE`) | Demand Fulfillment `Status` + `Gap` + `Skip_Reason` | `No eligible machine`; `Demand shortfall of 80 unit(s) (PARTIAL)` |
+| **Default cycle time** — `CycleTime_min` shows `"NA"` (SKU had no row in `Master_Curing_Design_CycleTime`, so the scheduler assumed a **15-min raw cure**, then applied buffer + efficiency like every other SKU → `(15 + 2.3) / 0.94 ≈ 18 min`) | Demand Fulfillment `CycleTime_min == "NA"` | `Cycle time missing in master — assumed 15 min cure (buffer + efficiency applied)` |
+
+A SKU can hit both (e.g. unschedulable **and** missing CT) — `reason` then states both.
+
+### Columns
+
+| Column | Meaning |
+|---|---|
+| `skuCode`, `skuDescription` | SKU + description (description from the demand table) |
+| `demand`, `plannedUnits`, `gap` | demand, what got planned, and the shortfall (`gap` uses the even-rounded planned, never negative) |
+| `fulfillmentPct`, `status` | the sheet's Fulfillment % and Status |
+| `reason` | human-readable explanation (LP skip reason and/or default-CT note) |
+| `cycleTime` | the **effective** cycle time the LP actually used (recovered from the Shift Schedule). For a defaulted SKU this is `(15 + buffer) / efficiency ≈ 18 min`, not the raw 15. `NULL` if the SKU was never scheduled (UNSCHEDULABLE). |
+| `defaultCycleTime` | **1** if the real CT was missing (`"NA"` — 15-min cure assumed, buffer + efficiency then applied), else **0** |
+| `createdAt`, `createdBy` | IST timestamp + `upload.created_by` |
+
+> Why flag default-CT SKUs even when fully met? Their plan rests on an **assumed**
+> 15-min raw cure time (scheduled at the buffer/efficiency-adjusted ~18 min). If the
+> real cure time differs, the actual schedule will run off — so planners should add
+> the missing SKU to `Master_Curing_Design_CycleTime` and re-plan.
+
+The table is created on first write via `CREATE TABLE IF NOT EXISTS` (idempotent,
+non-destructive). In **simulation** mode it resolves to `jkt_sim_plan_Infeasibility`.
+
+**Example** — 5 demand SKUs; LP fully meets 2 (one of them on a defaulted CT),
+partially meets 2, marks 1 unschedulable. → 4 rows written (the 1 fully-met SKU
+**with a real** CT is the only one omitted).
+
+---
+
+## 9. How it all fits together
 
 ```
               ┌─────────── Phase A (demand_route) ───────────┐
@@ -300,8 +347,14 @@ jkt_plan_params│              + w_q·norm_req                  │
               │   (per-SKU totals rounded UP to even tyres)   │
               │ capacity_writer  → jkt_plan_capacityUtilisation│
               │   (per-date, productive only, /1440)          │
+              │ infeasibility_writer → jkt_plan_Infeasibility │
+              │   (unmet/partial SKUs + "NA"/default-CT SKUs) │
               └─────────────────────────────────────────────┘
 ```
+
+> In **simulation** mode each table above becomes its `jkt_sim_*` counterpart
+> (e.g. `jkt_sim_plan_kpis`, `jkt_sim_plan_Infeasibility`); the engine and formulas
+> are identical. See [CLAUDE.md §13](../CLAUDE.md) / [README → Simulation mode](../README.md#simulation-mode).
 
 ### Quick reference
 

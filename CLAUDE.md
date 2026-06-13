@@ -13,9 +13,12 @@ A Linear-Programming-based **curing schedule generator** for JK Tyre's PCR
 1. Reads per-SKU demand and plan parameters from MySQL
 2. Computes a `ConsolidatedPriorityScore` per SKU
 3. Solves an LP that allocates ~170 presses' minutes optimally over a month
-4. Writes results back to MySQL in 3 tables and produces a 5-sheet Excel report
+4. Writes results back to MySQL in 4 tables and produces a 5-sheet Excel report
 
 It's exposed as a Flask HTTP API on port 5001, and also runnable from a CLI.
+
+The same engine runs in two **modes** — `planning` (jkt_* tables) and `simulation`
+(jkt_sim_* tables) — selected per request. See §13 for the simulation pipeline.
 
 ---
 
@@ -29,6 +32,12 @@ test_from_excel.py   ─┘                  (Phases A → B → C)
 
 All three call the same `run(cfg)` functions. Don't add behavior that's specific
 to one entry point — put logic in the route modules.
+
+`app.py` registers **two** Flask blueprints: the planning one from
+`V1.routes.api_route` (`/plan/generate-plan`) and the simulation one from
+`simulation.routes.api_route` (`/simulation/generate-plan`). Both funnel into the
+same `run(cfg)` functions; only `cfg["mode"]` (and thus the table names + output
+filenames) differs. See §13.
 
 ---
 
@@ -49,10 +58,18 @@ Phase B — schedule_route.run(cfg)  [serialized by _RUN_LOCK]
 
 Phase C — upload_route.run(cfg)
   • plan_status.assert_not_already_scheduled() — 409 if duplicate
-  • kpi_writer.upload()       → jkt_plan_kpis (1 row)
-  • plan_writer.upload()      → jkt_plan (~14k rows, even-tyre rule applied)
-  • capacity_writer.upload()  → jkt_plan_capacityUtilisation (per-date)
+  • kpi_writer.upload()           → jkt_plan_kpis (1 row)
+  • plan_writer.upload()          → jkt_plan (~14k rows, even-tyre rule applied)
+  • capacity_writer.upload()      → jkt_plan_capacityUtilisation (per-date)
+  • infeasibility_writer.upload() → jkt_plan_Infeasibility (1 row per at-risk SKU:
+                                    unmet/partial/unschedulable demand + SKUs whose
+                                    cycle time is "NA" = default 15-min cure, run
+                                    through (raw+buffer)/efficiency like any SKU)
 ```
+
+Phase-B & Phase-C output filenames carry a `{mode_tag}` (`""` planning, `sim_`
+simulation) so a /plan and a /simulation run for the same plan_id never overwrite
+each other's Excel. See §13.
 
 ---
 
@@ -66,8 +83,11 @@ Phase C — upload_route.run(cfg)
 | [V1/reports/kpi_writer.py](V1/reports/kpi_writer.py) | Writes `jkt_plan_kpis`. Computes KPIs from the Demand Fulfillment sheet + DB. Many helpers: `_is_real_sku_row`, `_count_planned_skus`, `_demand_weighted_fulfillment`, `_overall_capacity_utilisation`, `_round_up_to_even`, `_safe_number`. |
 | [V1/reports/plan_writer.py](V1/reports/plan_writer.py) | Writes `jkt_plan`. Applies even-tyre rule via `_round_sku_totals_up_to_even`. Uses kpi_writer's `_round_up_to_even` helper. |
 | [V1/reports/capacity_writer.py](V1/reports/capacity_writer.py) | Writes `jkt_plan_capacityUtilisation`. **Excludes** CHANGEOVER + mould-clean rows from busy time (productive utilization only). Shared `compute_daily_utilisation()` is used by both daily and overall calc. |
-| [config/config.yaml](config/config.yaml) | Single source for tunable parameters. **DB credentials NOT here** — they come from `.env`. |
-| [smoke_test.py](smoke_test.py) | 32 checks. Run before every commit. Zero DB side-effects. |
+| [V1/reports/infeasibility_writer.py](V1/reports/infeasibility_writer.py) | Writes `jkt_plan_Infeasibility` (one row per at-risk SKU). Reuses kpi_writer's `_is_real_sku_row` / `_safe_number` / `_round_up_to_even`. Creates the table via `CREATE TABLE IF NOT EXISTS` (idempotent, non-destructive). Flags `defaultCycleTime=1` for SKUs whose Demand-Fulfillment `CycleTime_min` is `"NA"` (default 15-min cure, scheduled at the buffer/efficiency-adjusted ~18 min). Reports the **effective** cycleTime (read from the Shift Schedule). |
+| [config/config.yaml](config/config.yaml) | Single source for tunable parameters, incl. the `tables:` block with `mode_token` (planning="" / simulation="sim_"). **DB credentials NOT here** — they come from `.env`. |
+| [V1/utilities/config_loader.py](V1/utilities/config_loader.py) | `load(mode=...)` → `apply_mode()` resolves logical→physical table names into `cfg["tbl"]`. `mode_file_tag()` returns the `{mode_tag}` used in output filenames. |
+| [simulation/](simulation/) | Thin simulation layer (§13). Routes re-export V1's `run()`; `sim_status` wraps `plan_status`. Same engine, jkt_sim_* tables. |
+| [smoke_test.py](smoke_test.py) | 45 checks. Run before every commit. Zero DB side-effects. |
 
 ---
 
@@ -133,6 +153,11 @@ Always use parameterized queries (`%s` placeholders). Never use f-strings or `.f
 | `jkt_plan_kpis` | plan_id (1 row), demandFulfillment, demandSKU, planSKU, capacityUtilisation, curingChangeovers, createdAt, createdBy |
 | `jkt_plan` | plan_id, skuCode, skuDescription, date, shift, startTime, endTime, qty, cycleTime, remarks, createdAt, createdBy |
 | `jkt_plan_capacityUtilisation` | plan_id, date, capacityUtilisation, createdAt, **creatdBy** (typo in schema — keep as-is) |
+| `jkt_plan_Infeasibility` | id (PK, auto), plan_id, skuCode, skuDescription, demand, plannedUnits, gap, fulfillmentPct, status, reason, cycleTime (effective CT used), **defaultCycleTime** (1 = CT was "NA"; default 15-min cure scheduled at ~18 min via buffer/efficiency), createdAt, createdBy. Auto-created by `infeasibility_writer` if absent. |
+
+> **Mode note:** in simulation mode every read/write table above resolves to its
+> `jkt_sim_*` counterpart (e.g. `jkt_sim_demand`, `jkt_sim_plan_Infeasibility`) via
+> `cfg["tbl"]`. Never hardcode `"jkt_..."` — read `cfg["tbl"]["<logical>"]`. See §13.
 
 ---
 
@@ -157,7 +182,7 @@ Daily `jkt_plan_capacityUtilisation` and overall `jkt_plan_kpis.capacityUtilisat
 ```bash
 source .venv/bin/activate
 python3 smoke_test.py
-# expect "32 passed, 0 skipped, 0 failed"
+# expect "45 passed, 0 skipped, 0 failed"
 ```
 
 ### Local LP test (no DB writes)
@@ -183,10 +208,15 @@ curl -X POST http://localhost:5001/app/v1/jkt/planning-scheduling/plan/generate-
 ### Re-run a `plan_id` (manual cleanup required)
 
 ```sql
-DELETE FROM jkt_plan_kpis              WHERE plan_id='<id>';
-DELETE FROM jkt_plan                   WHERE plan_id='<id>';
+DELETE FROM jkt_plan_kpis                WHERE plan_id='<id>';
+DELETE FROM jkt_plan                     WHERE plan_id='<id>';
 DELETE FROM jkt_plan_capacityUtilisation WHERE plan_id='<id>';
+DELETE FROM jkt_plan_Infeasibility       WHERE plan_id='<id>';
 ```
+
+For a **simulation** re-run, delete the same rows from the `jkt_sim_*` tables
+(`jkt_sim_plan_kpis`, `jkt_sim_plan`, `jkt_sim_plan_capacityUtilisation`,
+`jkt_sim_plan_Infeasibility`).
 
 ### Rebuild + push Docker images
 
@@ -246,3 +276,40 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 - [README.md](README.md) — user-facing project documentation
 - [docs/KPI_GUIDE.md](docs/KPI_GUIDE.md) — KPI formulas with worked numerical examples
 - Source code comments — especially in `V1/reports/*.py` (well-commented helpers)
+
+---
+
+## 13. Simulation mode (jkt_sim_* tables)
+
+The simulation page runs the **exact same engine** as planning against a parallel
+set of tables, so users can try "what-if" plans without touching production data.
+
+### How it works (the mode system)
+
+- `config_loader.load(mode="planning"|"simulation")` calls `apply_mode()`, which
+  reads `config.yaml → tables.mode_token` (`planning: ""`, `simulation: "sim_"`)
+  and builds `cfg["tbl"]` = `{logical_name → physical_table}`. The token is
+  inserted right after a leading `jkt_`:
+  `jkt_demand → jkt_sim_demand`, `jkt_plan_Infeasibility → jkt_sim_plan_Infeasibility`.
+- **Every** reader/writer takes table names from `cfg["tbl"][...]` (with a `jkt_*`
+  default). Nothing hardcodes a physical name — that's what makes one codebase
+  serve both modes. If you add a table, add it to `config.yaml → tables:` too.
+- Output Excel filenames carry `mode_file_tag(cfg)` (`""` / `"sim_"`) so the two
+  pipelines never overwrite each other in `output/` for the same plan_id.
+
+### The `simulation/` package
+
+| File | Role |
+|---|---|
+| `simulation/routes/api_route.py` | Blueprint `simulation` → `POST /app/v1/jkt/planning-scheduling/simulation/generate-plan`. Calls `config_loader.load(mode="simulation")`, then the shared A→B→C `run()`s. |
+| `simulation/routes/{demand,schedule,upload}_route.py` | **Thin re-exports** of V1's `run()` — `from V1.routes.X import run`. No logic. They exist so the simulation entry points are visible at a glance. |
+| `simulation/setups/sim_status.py` | `assert_not_already_simulated()` — wraps V1's `plan_status.assert_not_already_scheduled()` with the 3 sim output tables. |
+
+So new pipeline logic only ever goes in `V1/` — the simulation layer inherits it
+automatically via the re-exports + the mode-resolved table names. Don't duplicate
+engine logic into `simulation/`.
+
+### Concurrency note
+
+Planning and simulation share `V1.routes.schedule_route._RUN_LOCK`, so a concurrent
+`/plan` + `/simulation` request can't corrupt the LP's process-global `Config`.

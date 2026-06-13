@@ -353,6 +353,27 @@ def _():
         "missing _post_process_schedule_excel(path, default_ct_skus)"
 
 
+@check("schedule_route: default-CT SKUs run through (raw+buffer)/efficiency, not flat 15")
+def _():
+    """The 15-min default must be treated as a RAW cure time and pushed through
+    the same (raw + buffer) / efficiency formula as every other SKU — NOT
+    injected as a flat final cycle time."""
+    import inspect
+    from V1.routes import schedule_route as sr
+    src = inspect.getsource(sr.run_from_database)
+    assert "_DEFAULT_CT_MIN" in src, "default injection should reference _DEFAULT_CT_MIN"
+    assert "LOAD_UNLOAD_BUFFER_MIN" in src and "PRESS_EFFICIENCY" in src, \
+        "default cycle time must apply buffer + efficiency like every other SKU"
+    # The old flat assignment {"CycleTime_min": _DEFAULT_CT_MIN} must be gone.
+    assert 'CycleTime_min": _DEFAULT_CT_MIN' not in src, \
+        "default CT should no longer be assigned flat — must go through the formula"
+    # infeasibility_writer should report the EFFECTIVE CT from the Shift Schedule.
+    iw_src = inspect.getsource(__import__("V1.reports.infeasibility_writer",
+                                          fromlist=["_effective_cycle_times"]))
+    assert "_effective_cycle_times" in iw_src and "Shift Schedule" in iw_src, \
+        "infeasibility_writer must recover the effective CT from the Shift Schedule"
+
+
 @check("schedule_route: post-process Excel excludes CO+clean AND sets 'NA' for default CT SKUs")
 def _():
     """Build a tiny synthetic schedule Excel and run the post-process on it."""
@@ -579,6 +600,174 @@ def _():
     util = daily[0][1]
     # 480 productive min / 1440 = 33.33% (NOT 900/1440 = 62.5%)
     assert abs(util - 33.33) < 0.5, f"expected ~33.33% (productive only), got {util}"
+
+
+@check("simulation: package importable + Flask blueprint registered")
+def _():
+    """The simulation/ folder defines a Blueprint with prefix /app/v1/jkt/planning-scheduling
+    and route /simulation/generate-plan. Verify both load cleanly."""
+    import importlib
+    sim_api = importlib.import_module("simulation.routes.api_route")
+    assert hasattr(sim_api, "bp"), "simulation.routes.api_route must export bp"
+    assert sim_api.bp.name == "simulation", f"blueprint name should be 'simulation', got {sim_api.bp.name!r}"
+    assert sim_api.API_SIMULATE_PATH == "/simulation/generate-plan"
+    # Thin route wrappers re-export V1's run() — confirm
+    from simulation.routes import demand_route as sd, schedule_route as ss, upload_route as su
+    from V1.routes import demand_route as vd, schedule_route as vs, upload_route as vu
+    assert sd.run is vd.run, "simulation demand_route should re-export V1's run"
+    assert ss.run is vs.run, "simulation schedule_route should re-export V1's run"
+    assert su.run is vu.run, "simulation upload_route should re-export V1's run"
+
+
+@check("simulation: apply_mode('simulation') resolves to jkt_sim_* tables")
+def _():
+    """The mode_token system in config_loader inserts 'sim_' after 'jkt_'."""
+    from V1.utilities import config_loader
+    cfg = config_loader.load(mode="simulation")
+    assert cfg["mode"] == "simulation"
+    tbl = cfg["tbl"]
+    # All sim tables must include 'jkt_sim_' prefix
+    expected = {
+        "demand":        "jkt_sim_demand",
+        "plan_params":   "jkt_sim_plan_params",
+        "plan_kpis":     "jkt_sim_plan_kpis",
+        "plan":          "jkt_sim_plan",
+        "capacity":      "jkt_sim_plan_capacityUtilisation",
+    }
+    for logical, physical in expected.items():
+        assert tbl.get(logical) == physical, \
+            f"sim mode: tbl[{logical!r}] should be {physical!r}, got {tbl.get(logical)!r}"
+
+
+@check("simulation: planning mode still resolves to jkt_* tables (no regression)")
+def _():
+    """Ensure removing /simulation from V1's blueprint didn't break planning mode."""
+    from V1.utilities import config_loader
+    cfg = config_loader.load(mode="planning")
+    assert cfg["mode"] == "planning"
+    assert cfg["tbl"]["demand"] == "jkt_demand"
+    assert cfg["tbl"]["plan_params"] == "jkt_plan_params"
+    assert cfg["tbl"]["plan_kpis"] == "jkt_plan_kpis"
+    # V1's api_route blueprint should still expose /plan/generate-plan
+    from V1.routes import api_route as v1_api
+    assert v1_api.API_GENERATE_PATH == "/plan/generate-plan"
+    # And should NOT have a simulation route anymore (moved to simulation/)
+    assert not hasattr(v1_api, "API_SIMULATE_PATH"), \
+        "V1 api_route should no longer expose API_SIMULATE_PATH (moved to simulation/routes/api_route.py)"
+
+
+@check("simulation: sim_status delegates to V1's plan_status with sim table names")
+def _():
+    """sim_status.assert_not_already_simulated() pulls the 3 sim output table names
+    from cfg['tbl'] and hands them to plan_status."""
+    from simulation.setups import sim_status
+    from V1.setups import plan_status
+    import inspect
+    src = inspect.getsource(sim_status.assert_not_already_simulated)
+    assert "plan_status.assert_not_already_scheduled" in src, \
+        "sim_status should delegate to V1's plan_status"
+    assert 'tbl["plan_kpis"]' in src and 'tbl["plan"]' in src and 'tbl["capacity"]' in src, \
+        "should pass the 3 sim output tables to plan_status"
+
+
+@check("simulation: app.py registers BOTH planning + simulation blueprints")
+def _():
+    src = __import__("pathlib").Path("app.py").read_text()
+    assert "planning_bp" in src and "simulation_bp" in src, \
+        "app.py must register both blueprints"
+    assert "from simulation.routes.api_route import bp as simulation_bp" in src
+    # Confirm the live app actually has both URL rules
+    import importlib
+    app_module = importlib.import_module("app")
+    rules = {r.rule for r in app_module.app.url_map.iter_rules()}
+    assert "/app/v1/jkt/planning-scheduling/plan/generate-plan" in rules, \
+        f"planning route missing from URL map: {rules}"
+    assert "/app/v1/jkt/planning-scheduling/simulation/generate-plan" in rules, \
+        f"simulation route missing from URL map: {rules}"
+
+
+@check("filenames: mode_file_tag is '' for planning, 'sim_' for simulation")
+def _():
+    """Planning Excels keep their exact filename; simulation gets a 'sim_' marker
+    so the two pipelines never overwrite each other's output for the same plan_id."""
+    from V1.utilities import config_loader
+    plan_cfg = config_loader.load(mode="planning")
+    sim_cfg  = config_loader.load(mode="simulation")
+    assert config_loader.mode_file_tag(plan_cfg) == "", \
+        f"planning tag should be empty, got {config_loader.mode_file_tag(plan_cfg)!r}"
+    assert config_loader.mode_file_tag(sim_cfg) == "sim_", \
+        f"simulation tag should be 'sim_', got {config_loader.mode_file_tag(sim_cfg)!r}"
+
+
+@check("filenames: both Excel templates carry {mode_tag} and resolve distinctly")
+def _():
+    """The demand + schedule filename templates must include {mode_tag}, and the
+    two modes must resolve to DIFFERENT filenames for the same plan_id."""
+    from V1.utilities import config_loader
+    for mode in ("planning", "simulation"):
+        cfg = config_loader.load(mode=mode)
+        assert "{mode_tag}" in cfg["demand"]["output_excel"], \
+            "demand.output_excel must contain {mode_tag}"
+        assert "{mode_tag}" in cfg["schedule"]["output_excel"], \
+            "schedule.output_excel must contain {mode_tag}"
+    # Resolve the demand filename for both modes with the same plan_id.
+    pcfg = config_loader.load(mode="planning");   pcfg["plan"]["plan_id"] = "PID1"
+    scfg = config_loader.load(mode="simulation"); scfg["plan"]["plan_id"] = "PID1"
+    p_name = config_loader.resolve_paths(pcfg)["demand"]["output_excel"]
+    s_name = config_loader.resolve_paths(scfg)["demand"]["output_excel"]
+    assert p_name == "requirement_summary_PID1.xlsx", p_name
+    assert s_name == "requirement_summary_sim_PID1.xlsx", s_name
+    assert p_name != s_name, "planning and simulation must not share a filename"
+    # Schedule template resolves with mode_tag too (dates filled by the route).
+    s_sched = scfg["schedule"]["output_excel"].format(
+        mode_tag=config_loader.mode_file_tag(scfg),
+        plan_id="PID1", plan_start="2026-01-01", planning_days=30,
+    )
+    assert s_sched.startswith("PCR_Schedule_sim_PID1_"), s_sched
+
+
+@check("infeasibility_writer: importable + wired into upload_route")
+def _():
+    """The 4th output writer exists, exposes upload(), and Phase C calls it."""
+    import importlib
+    iw = importlib.import_module("V1.reports.infeasibility_writer")
+    assert hasattr(iw, "upload"), "infeasibility_writer must export upload()"
+    up_src = __import__("pathlib").Path("V1/routes/upload_route.py").read_text()
+    assert "infeasibility_writer" in up_src and "infeasibility_writer.upload(" in up_src, \
+        "upload_route must call infeasibility_writer.upload()"
+
+
+@check("infeasibility_writer: captures unmet demand AND default-CT (NA) SKUs")
+def _():
+    """Source-level guarantees: creates table non-destructively, flags NA cycle
+    time as default-15-used, reads the right Demand Fulfillment columns, and
+    delegates row-filtering to the shared kpi_writer helpers."""
+    import inspect
+    from V1.reports import infeasibility_writer as iw
+    up_src = inspect.getsource(iw.upload)
+    # Default-CT / NA handling
+    assert '"NA"' in up_src or "'NA'" in up_src, "must detect the 'NA' cycle-time marker"
+    assert "defaultCycleTime" in inspect.getsource(iw), "must record a defaultCycleTime flag"
+    assert "_DEFAULT_CT_MIN" in up_src, "must pull the default cycle time from schedule_route"
+    # Non-destructive table creation (append-only invariant preserved)
+    ensure_src = inspect.getsource(iw._ensure_table)
+    assert "CREATE TABLE IF NOT EXISTS" in ensure_src, "must create table idempotently"
+    assert "DROP" not in ensure_src and "ALTER" not in ensure_src, \
+        "must never drop/alter an existing table"
+    # Reuses shared helpers rather than re-implementing row filtering / coercion
+    mod_src = inspect.getsource(iw)
+    assert "_is_real_sku_row" in mod_src and "_safe_number" in mod_src, \
+        "should reuse kpi_writer's _is_real_sku_row / _safe_number"
+
+
+@check("infeasibility: apply_mode resolves jkt_plan_Infeasibility -> jkt_sim_plan_Infeasibility")
+def _():
+    """The 4th table name must be mode-aware exactly like the other outputs."""
+    from V1.utilities import config_loader
+    p = config_loader.load(mode="planning")["tbl"]["infeasibility"]
+    s = config_loader.load(mode="simulation")["tbl"]["infeasibility"]
+    assert p == "jkt_plan_Infeasibility", p
+    assert s == "jkt_sim_plan_Infeasibility", s
 
 
 @check("capacity_writer: divides by full fleet, not just used machines")

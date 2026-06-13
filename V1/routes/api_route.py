@@ -36,9 +36,9 @@ from V1.utilities.exceptions import PipelineError
 API_HOST            = "35.208.174.2"                       # public host for prod
 API_PORT            = 5001
 API_URL_PREFIX      = "/app/v1/jkt/planning-scheduling"
-API_GENERATE_PATH   = "/plan/generate-plan"              # planning page  -> jkt_*      tables
-API_SIMULATE_PATH   = "/simulation/generate-plan"        # simulation page -> jkt_sim_* tables
+API_GENERATE_PATH   = "/plan/generate-plan"              # planning page only -> jkt_* tables
 API_HEALTH_PATH     = "/health"
+# Simulation endpoint (/simulation/generate-plan) lives in simulation/routes/api_route.py
 
 # Convenience: the literal URL strings other code or docs can reference.
 GENERATE_URL = f"http://{API_HOST}:{API_PORT}{API_URL_PREFIX}{API_GENERATE_PATH}"
@@ -133,12 +133,6 @@ def _generate(mode: str):
 def generate_plan():
     """Planning page — reads/writes jkt_* tables."""
     return _generate("planning")
-
-
-@bp.route(API_SIMULATE_PATH, methods=["POST"])
-def generate_simulation():
-    """Simulation page — reads/writes jkt_sim_* tables (same pipeline)."""
-    return _generate("simulation")
 
 
 @bp.route(API_HEALTH_PATH, methods=["GET"])

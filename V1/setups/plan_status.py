@@ -4,8 +4,12 @@ Re-running a plan would create duplicate rows in jkt_plan_kpis / jkt_plan /
 jkt_plan_capacityUtilisation. Calling assert_not_already_scheduled() before
 starting a run rejects duplicates at the HTTP boundary with a 409 Conflict.
 
-This is by design — the pipeline never deletes or truncates. To re-run a
-plan_id, clean its rows out of the 3 target tables manually.
+The duplicate check guards the 3 core output tables below. (jkt_plan_Infeasibility
+is written last and auto-created, and is implicitly protected — a re-run is already
+blocked by the kpis row written first.)
+
+This is by design — the pipeline never deletes or truncates. To re-run a plan_id,
+clean its rows out of ALL 4 output tables manually (the 3 below + jkt_plan_Infeasibility).
 """
 from __future__ import annotations
 

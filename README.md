@@ -22,11 +22,12 @@ minutes optimally, and writes the resulting schedule back to the database.
 5. [KPIs computed](#kpis-computed)
 6. [Configuration](#configuration)
 7. [Database tables](#database-tables)
-8. [Local testing](#local-testing)
-9. [Docker deployment](#docker-deployment)
-10. [Troubleshooting](#troubleshooting)
-11. [Known constraints](#known-operational-constraints)
-12. [Project layout](#project-layout)
+8. [Simulation mode](#simulation-mode)
+9. [Local testing](#local-testing)
+10. [Docker deployment](#docker-deployment)
+11. [Troubleshooting](#troubleshooting)
+12. [Known constraints](#known-operational-constraints)
+13. [Project layout](#project-layout)
 
 ---
 
@@ -46,7 +47,7 @@ $EDITOR .env
 
 # 3. Sanity check (no DB writes, ~5 seconds)
 python3 smoke_test.py
-# expect: "32 passed, 0 skipped, 0 failed"
+# expect: "45 passed, 0 skipped, 0 failed"
 
 # 4a. CLI — full pipeline for a plan
 python3 main.py --plan-id <YOUR_PLAN_ID>
@@ -68,7 +69,7 @@ db_data_upload/
 ├── main.py                       # CLI entry — runs phases A→B→C
 ├── app.py                        # Flask app entry (port 5001)
 ├── test_from_excel.py            # Local LP test from Excel (no DB writes)
-├── smoke_test.py                 # 32-check sanity test (zero side-effects)
+├── smoke_test.py                 # 45-check sanity test (zero side-effects)
 ├── Dockerfile                    # python:3.11-slim + gunicorn
 ├── requirements.txt              # pinned dependencies
 ├── config/config.yaml            # unified config (DB, weights, scheduler knobs)
@@ -80,20 +81,26 @@ db_data_upload/
 │   │   ├── api_route.py          # POST /plan/generate-plan
 │   │   ├── demand_route.py       # PHASE A — compute CPS per SKU
 │   │   ├── schedule_route.py     # PHASE B — LP scheduler (1700 lines)
-│   │   └── upload_route.py       # PHASE C — orchestrate 3 DB writers
+│   │   └── upload_route.py       # PHASE C — orchestrate 4 DB writers
 │   ├── setups/                   # ── data loaders ──
 │   │   ├── plan_params.py        # SELECT FROM jkt_plan_params
 │   │   ├── demand_db.py          # SELECT FROM jkt_demand
 │   │   └── plan_status.py        # append-only guard (409 if duplicate)
 │   ├── utilities/                # ── shared helpers ──
-│   │   ├── config_loader.py      # YAML + env-var override (.env)
+│   │   ├── config_loader.py      # YAML + env-var override (.env) + mode/table resolution
 │   │   ├── db.py                 # mysql.connector + sqlalchemy factories
 │   │   ├── exceptions.py         # PipelineError (HTTP-aware)
 │   │   └── time_utils.py         # now_ist() — IST (UTC+5:30) timestamps
 │   └── reports/                  # ── DB writers ──
 │       ├── kpi_writer.py         # → jkt_plan_kpis (1 row)
 │       ├── plan_writer.py        # → jkt_plan (~14k rows)
-│       └── capacity_writer.py    # → jkt_plan_capacityUtilisation (per date)
+│       ├── capacity_writer.py    # → jkt_plan_capacityUtilisation (per date)
+│       └── infeasibility_writer.py # → jkt_plan_Infeasibility (per at-risk SKU)
+│
+├── simulation/                   # ── SIMULATION mode (jkt_sim_* tables) ──
+│   ├── routes/api_route.py       # POST /simulation/generate-plan
+│   ├── routes/{demand,schedule,upload}_route.py  # thin re-exports of V1's run()
+│   └── setups/sim_status.py      # append-only guard for jkt_sim_* outputs
 │
 ├── docs/
 │   └── KPI_GUIDE.md              # KPI definitions + worked examples
@@ -138,8 +145,14 @@ db_data_upload/
                   │  • capacity_writer.upload()                       │
                   │      → INSERT INTO jkt_plan_capacityUtilisation  │
                   │      (productive minutes only, no CO/clean)      │
+                  │  • infeasibility_writer.upload()                  │
+                  │      → INSERT INTO jkt_plan_Infeasibility         │
+                  │      (unmet/partial SKUs + "NA"/default-CT SKUs) │
                   └──────────────────────────────────────────────────┘
 ```
+
+> In **simulation** mode every table above resolves to its `jkt_sim_*` counterpart
+> and the output Excels get a `sim_` filename prefix. See [Simulation mode](#simulation-mode).
 
 ---
 
@@ -148,9 +161,13 @@ db_data_upload/
 The full URL is exported as a constant in [V1/routes/api_route.py:43](V1/routes/api_route.py#L43).
 
 ```
-POST http://<host>:5001/app/v1/jkt/planning-scheduling/plan/generate-plan
+POST http://<host>:5001/app/v1/jkt/planning-scheduling/plan/generate-plan        # planning  → jkt_*
+POST http://<host>:5001/app/v1/jkt/planning-scheduling/simulation/generate-plan  # simulation → jkt_sim_*
 GET  http://<host>:5001/app/v1/jkt/planning-scheduling/health
 ```
+
+Both POST endpoints take the same body and run the same engine — they differ only
+in which table set (and output-filename prefix) they use. See [Simulation mode](#simulation-mode).
 
 ### Request body
 
@@ -284,8 +301,51 @@ The pipeline reads these from the plan's row and overrides YAML defaults when se
 | `jkt_plan_kpis` | `kpi_writer` | 1 |
 | `jkt_plan` | `plan_writer` | ~14,000 (one per scheduled slot) |
 | `jkt_plan_capacityUtilisation` | `capacity_writer` | One per planning day (~30) |
+| `jkt_plan_Infeasibility` | `infeasibility_writer` | One per at-risk SKU (unmet/partial/unschedulable demand + SKUs with `"NA"` cycle time — i.e. a default 15-min cure scheduled at the buffer/efficiency-adjusted ~18 min). Auto-created via `CREATE TABLE IF NOT EXISTS`. |
 
-The pipeline **never deletes or truncates**. Each `plan_id` can be scheduled exactly once — repeat calls return **HTTP 409 Conflict**. To re-run a plan_id, manually `DELETE WHERE plan_id=...` from the 3 output tables.
+In **simulation** mode these resolve to `jkt_sim_plan_kpis`, `jkt_sim_plan`,
+`jkt_sim_plan_capacityUtilisation`, and `jkt_sim_plan_Infeasibility`.
+
+The pipeline **never deletes or truncates**. Each `plan_id` can be scheduled exactly once — repeat calls return **HTTP 409 Conflict**. To re-run a plan_id, manually `DELETE WHERE plan_id=...` from the **4** output tables (or their `jkt_sim_*` counterparts for a simulation re-run).
+
+---
+
+## Simulation mode
+
+The **simulation page** lets users run "what-if" plans without touching production
+planning data. It runs the **exact same engine** as planning against a parallel set
+of tables.
+
+```
+POST /app/v1/jkt/planning-scheduling/simulation/generate-plan   body: {"plan_id": "<id>"}
+```
+
+| | Planning | Simulation |
+|---|---|---|
+| Endpoint | `/plan/generate-plan` | `/simulation/generate-plan` |
+| Reads | `jkt_demand`, `jkt_plan_params` | `jkt_sim_demand`, `jkt_sim_plan_params` |
+| Writes | `jkt_plan_kpis`, `jkt_plan`, `jkt_plan_capacityUtilisation`, `jkt_plan_Infeasibility` | the same names with a `jkt_sim_` prefix |
+| Output Excel | `PCR_Schedule_<id>_…xlsx` | `PCR_Schedule_sim_<id>_…xlsx` |
+
+### How it works
+
+- **One token does it all.** `config/config.yaml → tables.mode_token` maps
+  `planning → ""` and `simulation → "sim_"`. `config_loader.load(mode=...)` inserts
+  that token right after `jkt_` in every table name, building `cfg["tbl"]`. Every
+  reader/writer takes its table name from `cfg["tbl"][...]` — nothing is hardcoded.
+- **Filenames are mode-tagged** (`mode_file_tag()`), so a `/plan` and a `/simulation`
+  run for the same `plan_id` never overwrite each other's Excel in `output/`.
+- The `simulation/` package is **thin**: its route modules just re-export V1's
+  `run()` functions. All engine logic lives in `V1/` and both modes inherit it.
+- Both modes share the LP's `_RUN_LOCK`, so concurrent `/plan` + `/simulation`
+  requests can't corrupt the scheduler's process-global `Config`.
+
+### Setup
+
+The `jkt_sim_*` input tables (`jkt_sim_demand`, `jkt_sim_plan_params`) must exist
+and be seeded just like their planning counterparts. The output tables are created
+on first write (`jkt_sim_plan_Infeasibility` is auto-created; the other three should
+mirror the planning schemas, including the `creatdBy` typo column).
 
 ---
 
@@ -361,7 +421,7 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 |---------|-------------|
 | `404 plan_params` | `plan_id` missing from `jkt_plan_params` — INSERT a row first |
 | `404 demand` | No rows in `jkt_demand` for this `plan_id` — seed demand first |
-| `409 duplicate_check` | `plan_id` already scheduled — manually DELETE its rows from the 3 output tables to re-run |
+| `409 duplicate_check` | `plan_id` already scheduled — manually DELETE its rows from the 4 output tables to re-run |
 | `412 upload` | Schedule Excel missing before Phase C, OR Machine Utilization sheet has no machines |
 | Browser times out at 30/60s | JS client default timeout. Set 600_000 ms explicitly. |
 | `Address already in use` on port 5001 | Stale Flask. `lsof -nP -iTCP:5001` → `kill <pid>` |
@@ -369,6 +429,7 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 | `externally-managed-environment` on pip | Use a virtual env: `python3 -m venv .venv && source .venv/bin/activate` |
 | amd64 build slow on M-series Mac | QEMU emulation — ~5–10 min vs 1 min native. One-time cost. |
 | Smoke test fails on `_count_demand_skus` | `jkt_demand` empty for the auto-discovered test plan — DB state drift, not a code issue |
+| `/simulation` returns `404 plan_params` / `404 demand` | The `jkt_sim_*` input tables aren't seeded for this `plan_id`. Simulation reads `jkt_sim_demand` / `jkt_sim_plan_params`, not the planning tables. |
 
 ---
 
@@ -401,7 +462,7 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 
 ### Smoke test (`smoke_test.py`)
 
-32 checks covering: filesystem, imports, config, DB connectivity, table presence, demand loaders, CPS math, KPI math, capacity math, Flask routes, error mapping. Zero side effects on the DB. Run before every Docker push.
+45 checks covering: filesystem, imports, config, DB connectivity, table presence, demand loaders, CPS math, KPI math, capacity math, Flask routes, error mapping, the infeasibility writer, mode-aware filenames, and the simulation blueprint/table resolution. Zero side effects on the DB. Run before every Docker push.
 
 ### File-history note
 

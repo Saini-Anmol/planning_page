@@ -1571,7 +1571,8 @@ def run_from_excel(
     return results
 
 
-_DEFAULT_CT_MIN = 15.0          # default cycle time (min) for SKUs missing in master
+_DEFAULT_CT_MIN = 15.0          # default RAW cure time (min) for SKUs missing in master;
+                                # (raw + buffer) / efficiency is applied like any other SKU
 
 
 def _post_process_schedule_excel(path: str, default_ct_skus: set) -> None:
@@ -1583,10 +1584,11 @@ def _post_process_schedule_excel(path: str, default_ct_skus: set) -> None:
        definition we use everywhere else.
 
     2. CycleTime_min column on the Demand Fulfillment sheet shows "NA" for any
-       SKU that received the default cycle time of 15 min (i.e. the SKU had no
-       row in Master_Curing_Design_CycleTime). The LP used 15 internally for
-       scheduling, but the user-facing report makes the missing-data status
-       explicit.
+       SKU that received the default cycle time (i.e. the SKU had no row in
+       Master_Curing_Design_CycleTime). Internally the LP used the default cure
+       time of 15 min run through (raw + buffer) / efficiency — same as every
+       other SKU — but the user-facing report shows "NA" to make the
+       missing-master-data status explicit.
     """
     import openpyxl
     from collections import defaultdict
@@ -1779,19 +1781,27 @@ def run_from_database(
     df_running = etl.load_running_moulds()
     df_mould_m = etl.load_mould_master()
 
-    # ── Inject default cycle time (15 min) for demand SKUs missing in master ──
-    # These SKUs become schedulable; their CycleTime_min will display as "NA"
-    # in the final Excel via _post_process_schedule_excel.
+    # ── Inject default cycle time for demand SKUs missing in master ──
+    # The default 15 min is a RAW cure time, so it goes through the SAME
+    # (raw + buffer) / efficiency formula used for every other SKU in
+    # ETL.load_cycle_times — default SKUs are then scheduled on a comparable
+    # basis (press load/unload buffer + efficiency included). Their
+    # CycleTime_min still displays as "NA" in the final Excel via
+    # _post_process_schedule_excel to flag the missing-master-data status.
     have_ct      = set(df_cycles["SKUCode"].astype(str))
     demand_skus  = set(df_demand["SKUCode"].astype(str))
     missing_ct   = demand_skus - have_ct
     if missing_ct:
+        default_ct = float(np.round(
+            (_DEFAULT_CT_MIN + Config.LOAD_UNLOAD_BUFFER_MIN) / Config.PRESS_EFFICIENCY
+        ))
         extra = pd.DataFrame(
-            {"SKUCode": sorted(missing_ct), "CycleTime_min": _DEFAULT_CT_MIN}
+            {"SKUCode": sorted(missing_ct), "CycleTime_min": default_ct}
         )
         df_cycles = pd.concat([df_cycles, extra], ignore_index=True)
         print(f"[Phase 0] CT default applied to {len(missing_ct)} SKU(s) "
-              f"(cycle={_DEFAULT_CT_MIN} min — shown as 'NA' in output)")
+              f"(raw {_DEFAULT_CT_MIN} + buffer {Config.LOAD_UNLOAD_BUFFER_MIN} "
+              f"/ eff {Config.PRESS_EFFICIENCY} = {default_ct} min — shown as 'NA' in output)")
 
     tracker = MouldTracker()
     tracker.load_from_df(df_mould_m, df_running)
@@ -1877,7 +1887,10 @@ def _run_locked(cfg: dict) -> dict:
     if isinstance(pe_date, _dt.datetime):
         pe_date = pe_date.date()
     days = (pe_date - ps_date).days + 1
-    out_name = out_template.format(plan_id=plan_id, plan_start=ps_date, planning_days=days)
+    out_name = out_template.format(
+        mode_tag=_cl.mode_file_tag(cfg), plan_id=plan_id,
+        plan_start=ps_date, planning_days=days,
+    )
     out_path = str(out_dir / out_name)
 
     # --------------------------------------------------------------------

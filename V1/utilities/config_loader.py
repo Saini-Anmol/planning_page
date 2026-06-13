@@ -109,11 +109,27 @@ def load(path: Path | str | None = None, mode: str = DEFAULT_MODE) -> dict:
     return cfg
 
 
+def mode_file_tag(cfg: dict) -> str:
+    """Filename infix that keeps planning and simulation output Excels distinct.
+
+    Reuses the SAME mode_token used for table-name resolution: "" for planning,
+    "sim_" for simulation. Planning filenames are therefore unchanged, while a
+    /simulation run writes "sim_"-prefixed Excel files — so it can never
+    overwrite the /plan run's output (or vice-versa) for the same plan_id.
+    """
+    mode = cfg.get("mode", DEFAULT_MODE)
+    tokens = cfg.get("tables", {}).get("mode_token", {})
+    return tokens.get(mode, "") or ""
+
+
 def resolve_paths(cfg: dict) -> dict:
-    """Replace {plan_id} placeholders in known path-template fields."""
-    plan_id = cfg["plan"]["plan_id"]
+    """Replace {plan_id} / {mode_tag} placeholders in known path-template fields."""
+    plan_id  = cfg["plan"]["plan_id"]
+    mode_tag = mode_file_tag(cfg)
     if "demand" in cfg and "output_excel" in cfg["demand"]:
-        cfg["demand"]["output_excel"] = cfg["demand"]["output_excel"].format(plan_id=plan_id)
+        cfg["demand"]["output_excel"] = cfg["demand"]["output_excel"].format(
+            plan_id=plan_id, mode_tag=mode_tag
+        )
     return cfg
 
 

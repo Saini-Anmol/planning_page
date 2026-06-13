@@ -51,7 +51,9 @@ tables:
 # -------------------------------------------------------------------------
 demand:
   # Demand is read from jkt_demand DB table (filtered by plan_id).
-  output_excel: "requirement_summary_{plan_id}.xlsx"
+  # {mode_tag} is "" for planning, "sim_" for simulation — keeps the two
+  # pipelines' Excels from overwriting each other for the same plan_id.
+  output_excel: "requirement_summary_{mode_tag}{plan_id}.xlsx"
   output_sheet: requirement_summary
   market_aliases:
     OE: oe
@@ -90,7 +92,8 @@ demand:
 # Phase B — LP scheduler (curing schedule)
 # -------------------------------------------------------------------------
 schedule:
-  output_excel: "PCR_Schedule_{plan_id}_{plan_start}_{planning_days}days.xlsx"
+  # {mode_tag} is "" for planning, "sim_" for simulation (see demand.output_excel).
+  output_excel: "PCR_Schedule_{mode_tag}{plan_id}_{plan_start}_{planning_days}days.xlsx"
   tyre_type: pcr
   shifts_per_day: 3
   hours_per_shift: 8
