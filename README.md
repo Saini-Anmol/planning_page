@@ -1,11 +1,16 @@
-# JK Tyre — PCR Curing Planning & Scheduling Pipeline (V1)
+# JK Tyre — PCR Curing Planning & Simulation Pipeline
 
 A production-grade LP-based scheduling pipeline for tyre curing operations. Given a
 `plan_id`, the engine pulls demand and plan parameters from MySQL, computes a
 priority score per SKU, runs a Linear Programming solver to allocate press
 minutes optimally, and writes the resulting schedule back to the database.
 
-**Three entry points (same pipeline, same outputs):**
+**Two endpoints (same engine, different table sets):**
+
+- **Planning** — `POST /plan/generate-plan` → reads/writes `jkt_*` tables
+- **Simulation** — `POST /simulation/generate-plan` → reads/writes `jkt_sim_*` tables
+
+**Three entry points to the planning pipeline (same code path):**
 
 - **HTTP API** — Flask app on port 5001 (for JS/UI backends)
 - **CLI** — `python3 main.py --plan-id <id>` (for batch/dev)
@@ -18,16 +23,17 @@ minutes optimally, and writes the resulting schedule back to the database.
 1. [Quick start](#quick-start)
 2. [Architecture](#architecture)
 3. [Pipeline phases](#pipeline-phases)
-4. [API endpoint](#api-endpoint)
-5. [KPIs computed](#kpis-computed)
-6. [Configuration](#configuration)
-7. [Database tables](#database-tables)
-8. [Simulation mode](#simulation-mode)
-9. [Local testing](#local-testing)
-10. [Docker deployment](#docker-deployment)
-11. [Troubleshooting](#troubleshooting)
-12. [Known constraints](#known-operational-constraints)
-13. [Project layout](#project-layout)
+4. [Excel post-processing](#excel-post-processing)
+5. [API endpoint](#api-endpoint)
+6. [KPIs computed](#kpis-computed)
+7. [Configuration](#configuration)
+8. [Database tables](#database-tables)
+9. [Simulation mode](#simulation-mode)
+10. [Local testing](#local-testing)
+11. [Docker deployment](#docker-deployment)
+12. [Troubleshooting](#troubleshooting)
+13. [Known constraints](#known-operational-constraints)
+14. [Project layout](#project-layout)
 
 ---
 
@@ -47,7 +53,7 @@ $EDITOR .env
 
 # 3. Sanity check (no DB writes, ~5 seconds)
 python3 smoke_test.py
-# expect: "45 passed, 0 skipped, 0 failed"
+# expect: "47 passed, 0 skipped, 0 failed"
 
 # 4a. CLI — full pipeline for a plan
 python3 main.py --plan-id <YOUR_PLAN_ID>
@@ -67,9 +73,9 @@ curl -X POST http://localhost:5001/app/v1/jkt/planning-scheduling/plan/generate-
 ```
 db_data_upload/
 ├── main.py                       # CLI entry — runs phases A→B→C
-├── app.py                        # Flask app entry (port 5001)
+├── app.py                        # Flask app entry (port 5001, BOTH endpoints)
 ├── test_from_excel.py            # Local LP test from Excel (no DB writes)
-├── smoke_test.py                 # 45-check sanity test (zero side-effects)
+├── smoke_test.py                 # 47-check sanity test (zero side-effects)
 ├── Dockerfile                    # python:3.11-slim + gunicorn
 ├── requirements.txt              # pinned dependencies
 ├── config/config.yaml            # unified config (DB, weights, scheduler knobs)
@@ -127,16 +133,23 @@ db_data_upload/
    (cycles,       │  • override Config.PLAN_DATE, PLANNING_DAYS,       │
    eligibility,   │    PRESS_EFFICIENCY, MAX_CHANGEOVERS_PER_SHIFT    │
    GT inventory,  │    from jkt_plan_params row                       │
-   mould master)  │  • run LP solver (scipy.linprog)                 │
-        │        │  • round continuous → integer cycles              │
-        ▼        │  • build shift-wise schedule + changeovers        │
-   ─────────────►│  • write PCR_Schedule_<plan_id>_*.xlsx (5 sheets) │
+   mould master)  │  • inject default cycle time = 15 min for SKUs    │
+        │        │    missing in Master_Curing_Design_CycleTime       │
+        │        │    (LP plans them; output shows CT as "NA")        │
+        │        │  • run LP solver (scipy.linprog)                 │
+        ▼        │  • round continuous → integer cycles              │
+   ─────────────►│  • build shift-wise schedule + changeovers        │
+                  │  • write PCR_Schedule_<plan_id>_*.xlsx (5 sheets) │
+                  │  • POST-PROCESS the Excel (see § Excel post-      │
+                  │    processing below)                              │
                   └─────────────────────┬────────────────────────────┘
                                         ▼
                   ┌──────────────────── Phase C ────────────────────┐
                   │ upload_route.run()                                │
                   │  • plan_status.assert_not_already_scheduled(...) │
-                  │    (raises 409 if plan_id already has rows)      │
+                  │    (raises 409 if plan_id has rows in ANY of      │
+                  │     the 4 output tables — kpis/plan/capacity/     │
+                  │     infeasibility)                                │
                   │  • kpi_writer.upload()                            │
                   │      → INSERT INTO jkt_plan_kpis                  │
                   │  • plan_writer.upload()                            │
@@ -147,12 +160,36 @@ db_data_upload/
                   │      (productive minutes only, no CO/clean)      │
                   │  • infeasibility_writer.upload()                  │
                   │      → INSERT INTO jkt_plan_Infeasibility         │
-                  │      (unmet/partial SKUs + "NA"/default-CT SKUs) │
+                  │      (unmet/partial SKUs + "NA"/default-CT SKUs;  │
+                  │       auto-creates the table on first write)      │
                   └──────────────────────────────────────────────────┘
 ```
 
 > In **simulation** mode every table above resolves to its `jkt_sim_*` counterpart
 > and the output Excels get a `sim_` filename prefix. See [Simulation mode](#simulation-mode).
+
+---
+
+## Excel post-processing
+
+After the legacy LP solver writes the 5-sheet schedule Excel, `schedule_route._post_process_schedule_excel()`
+runs three corrections before Phase C reads it. These are display-only fixes — the LP's
+production decisions are unchanged, but the user-facing artefact becomes self-consistent.
+
+| Fix | Sheet affected | What it does |
+|---|---|---|
+| **1. Machine Schedule rebuild** | `Machine Schedule` | Re-aggregates `Units_Planned`, `Cycles`, `Mins_Used` per `(Machine, SKU)` directly from the `Shift Schedule` sheet. The legacy `df_mach` only captured the LP's first-pass allocation, so continuity runs + extra production added later by the `ScheduleBuilder` never propagated back — totals could differ by 3× from the real schedule. After this fix, **Σ Units_Planned reconciles exactly with Σ Qty in Shift Schedule and Σ Planned_Units in Demand Fulfillment**. |
+| **2. Default cycle time → "NA" display** | `Demand Fulfillment` (and `Machine Schedule`) | SKUs missing from `Master_Curing_Design_CycleTime` get a default 15-min cycle injected so the LP can schedule them. In the output, their `CycleTime_min` column shows `"NA"` to make the missing-data status explicit. The Infeasibility writer also flags these rows with `defaultCycleTime=1` in `jkt_plan_Infeasibility`. |
+| **3. Machine Utilization productive-only** | `Machine Utilization` | Recomputes `Used_Mins`, `Idle_Mins`, `Utilization_Pct` excluding `CHANGEOVER` and `MOULD_CLEAN` rows so the per-machine util matches the productive-only definition used by `jkt_plan_capacityUtilisation`. Idle time is implicit (no row in Shift Schedule = not counted as busy). |
+
+A machine genuinely at 100% util after these fixes ran a single SKU end-to-end all month
+(no changeovers needed, mould life never reached `NEW_MOULD_LIFE = 3000` cycles, so no
+clean was scheduled). It's not a bug — there was simply nothing else to subtract.
+
+The DB writers (`kpi_writer`, `plan_writer`, `capacity_writer`) read from `Demand Fulfillment`
+and `Shift Schedule` — both of which were always correct — so DB outputs were not affected
+by the pre-fix discrepancies. The post-process keeps the Excel sheets in agreement so
+human auditors don't see ghost mismatches.
 
 ---
 
@@ -192,7 +229,7 @@ in which table set (and output-filename prefix) they use. See [Simulation mode](
 | 400 | `validation` | Missing/empty/non-string `plan_id`, malformed JSON, plan_id > 50 chars |
 | 404 | `plan_params` | `plan_id` not found in `jkt_plan_params` |
 | 404 | `demand` | No rows in `jkt_demand` for this `plan_id` |
-| 409 | `duplicate_check` | This `plan_id` is already scheduled (append-only guard) |
+| 409 | `duplicate_check` | This `plan_id` already has rows in ANY of the 4 output tables (kpis, plan, capacity, **infeasibility**) — append-only guard. Manual `DELETE WHERE plan_id=...` from all 4 tables is required to re-run. |
 | 412 | `upload` | Schedule Excel went missing before Phase C OR Machine Utilization sheet has no machines |
 | 422 | `demand` | All three CPS weights are zero |
 | 500 | varies | Unexpected — returns last 6 lines of traceback |
@@ -370,48 +407,65 @@ Rows with non-numeric, inf, NaN, or negative `Requirement` are silently skipped 
 
 ## Docker deployment
 
-### Build locally (both architectures)
-
-```bash
-# arm64 (Apple Silicon)
-docker build -t jkt-planning:v1 .
-
-# amd64 (Intel/AMD — Windows, Intel Linux, AWS x86)
-docker buildx build --platform linux/amd64 -t jkt-planning:v1-amd64 --load .
-```
-
-### Run
-
-```bash
-docker run --rm -p 5001:5001 \
-    --env-file .env \
-    -v $(pwd)/output:/app/output \
-    --name jkt-api \
-    jkt-planning:v1                   # or jkt-planning:v1-amd64 on Windows/Intel
-```
-
-### Docker Hub
+### Latest published image
 
 ```
-Image: anmolsaini07/jkt-planning:v1-amd64
+Image: anmolsaini07/jkt-planning:v2-amd64           (current — planning + simulation)
 URL:   https://hub.docker.com/r/anmolsaini07/jkt-planning/tags
 ```
 
-To pull and run on Windows / Intel Linux:
+Previous `v1-amd64` tag is retained on Docker Hub for instant rollback.
+
+| Tag | Contains |
+|---|---|
+| `v2-amd64` | Planning + Simulation endpoints, Infeasibility writer, Machine Schedule rebuild, default-CT="NA" handling, Machine Utilization CO/clean exclusion, 4-table duplicate-check |
+| `v1-amd64` | Planning endpoint only (legacy — kept for rollback) |
+
+### Pull and run on the production host (Windows / Intel Linux)
+
+```bash
+docker pull anmolsaini07/jkt-planning:v2-amd64
+
+docker run -d -p 5001:5001 \
+    --env-file .env \
+    -v $(pwd)/output:/app/output \
+    --name jkt-api \
+    --restart unless-stopped \
+    anmolsaini07/jkt-planning:v2-amd64
+```
+
+PowerShell equivalent:
 
 ```powershell
-docker pull anmolsaini07/jkt-planning:v1-amd64
-docker run --rm -p 5001:5001 --env-file .env `
+docker pull anmolsaini07/jkt-planning:v2-amd64
+docker run -d -p 5001:5001 --env-file .env `
     -v ${PWD}/output:/app/output --name jkt-api `
+    --restart unless-stopped `
+    anmolsaini07/jkt-planning:v2-amd64
+```
+
+### Rollback to v1 if anything breaks after deploy
+
+```bash
+docker stop jkt-api && docker rm jkt-api
+docker run -d -p 5001:5001 --env-file .env --name jkt-api \
+    --restart unless-stopped \
     anmolsaini07/jkt-planning:v1-amd64
 ```
 
-### Re-push after code changes
+### Build locally before pushing a new version
 
 ```bash
-docker tag jkt-planning:v1-amd64 anmolsaini07/jkt-planning:v1-amd64
-docker push anmolsaini07/jkt-planning:v1-amd64
+# arm64 (Apple Silicon) — local dev only
+docker build -t jkt-planning:v2 .
+
+# amd64 (Intel/AMD — Windows, Intel Linux, AWS x86) — what production runs
+docker buildx build --platform linux/amd64 -t anmolsaini07/jkt-planning:v2-amd64 --load .
+
+docker push anmolsaini07/jkt-planning:v2-amd64
 ```
+
+Bump the tag (`v3-amd64`, etc.) on each push if you want clean rollback points. Overwriting the same tag is supported but loses the rollback target.
 
 ---
 
@@ -421,7 +475,7 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 |---------|-------------|
 | `404 plan_params` | `plan_id` missing from `jkt_plan_params` — INSERT a row first |
 | `404 demand` | No rows in `jkt_demand` for this `plan_id` — seed demand first |
-| `409 duplicate_check` | `plan_id` already scheduled — manually DELETE its rows from the 4 output tables to re-run |
+| `409 duplicate_check` | `plan_id` already scheduled — manually `DELETE WHERE plan_id=...` from ALL 4 output tables (`kpis`, `plan`, `capacity`, **`infeasibility`**) to re-run. Forgetting any one of the 4 means re-run will still be blocked (this is intentional — it stops silent row duplication). |
 | `412 upload` | Schedule Excel missing before Phase C, OR Machine Utilization sheet has no machines |
 | Browser times out at 30/60s | JS client default timeout. Set 600_000 ms explicitly. |
 | `Address already in use` on port 5001 | Stale Flask. `lsof -nP -iTCP:5001` → `kill <pid>` |
@@ -437,7 +491,7 @@ docker push anmolsaini07/jkt-planning:v1-amd64
 
 | Constraint | Severity | Reason |
 |------------|----------|--------|
-| **Single-worker only** | Medium | LP scheduler's `Config` is process-global; `gunicorn --workers 1` enforced. Multi-worker would race on plan dates. |
+| **Single-worker only** | Medium | LP scheduler's `Config` is process-global; `gunicorn --workers 1` enforced. Multi-worker would race on plan dates. The same `_RUN_LOCK` serializes planning AND simulation runs, so they queue behind each other rather than racing. |
 | **Append-only — no in-place updates** | By design | Same plan_id rejected with HTTP 409. Manual DB DELETE required to retry. |
 | **Synchronous API** | Low | LP holds the connection for 1–5 min. Clients need long timeouts. |
 | **No auth / CORS / rate-limiting** | Low | Suitable for internal pilot. Add before exposing externally. |
@@ -455,14 +509,23 @@ docker push anmolsaini07/jkt-planning:v1-amd64
   - DB credentials → `.env` (not in YAML, not in code)
   - YAML defaults → `config.yaml`
   - Per-plan overrides → `jkt_plan_params` row
+- **One engine, two endpoints**: planning + simulation share every Python module
+  in `V1/`. The only difference is `cfg["tbl"]` (resolved by
+  `config_loader.apply_mode("planning"|"simulation")`) and the output filename
+  prefix. The `simulation/` package contains the API blueprint + thin re-exports
+  of V1's pipeline functions — no business logic duplication.
 - **Shared helpers** to prevent drift:
   - `_round_up_to_even()` in [kpi_writer.py](V1/reports/kpi_writer.py) — used by both writers
   - `compute_daily_utilisation()` in [capacity_writer.py](V1/reports/capacity_writer.py) — used by both daily and overall capacity KPIs
+  - `_post_process_schedule_excel()` in [schedule_route.py](V1/routes/schedule_route.py) — single place where Excel display fixes live (Machine Schedule rebuild, Machine Util CO/clean exclusion, CT="NA" display)
+- **Default cycle time = 15 min** for any demand SKU missing from `Master_Curing_Design_CycleTime`. The LP uses 15 internally; the output Excel shows `"NA"` for those SKUs and the Infeasibility table flags them with `defaultCycleTime=1`.
+- **Duplicate check covers ALL 4 output tables** (`kpis`, `plan`, `capacity`, `infeasibility`). A partial cleanup that forgets the Infeasibility table cannot silently duplicate rows on re-run — `assert_not_already_scheduled()` catches it at HTTP 409.
+- **Productive-only utilization**: every site that reports utilization (`Machine Utilization` sheet, `jkt_plan_capacityUtilisation` table, `jkt_plan_kpis.capacityUtilisation` KPI) excludes `CHANGEOVER` rows, `MOULD_CLEAN` rows, and implicit idle gaps. Same definition across all 4 sites; no drift possible.
 - **All `createdAt` timestamps**: IST via `now_ist()` regardless of host timezone
 
 ### Smoke test (`smoke_test.py`)
 
-45 checks covering: filesystem, imports, config, DB connectivity, table presence, demand loaders, CPS math, KPI math, capacity math, Flask routes, error mapping, the infeasibility writer, mode-aware filenames, and the simulation blueprint/table resolution. Zero side effects on the DB. Run before every Docker push.
+47 checks covering: filesystem, imports, config, DB connectivity, table presence, demand loaders, CPS math, KPI math, capacity math, Flask routes, error mapping, the infeasibility writer, mode-aware filenames, the simulation blueprint/table resolution, the Excel post-processing (Machine Schedule rebuild + default-CT "NA" display + Machine Utilization CO/clean exclusion), and the **4-table duplicate-check** (kpis + plan + capacity + **infeasibility**) for both planning and simulation modes. Zero side effects on the DB. Run before every Docker push.
 
 ### File-history note
 
