@@ -656,18 +656,35 @@ def _():
         "V1 api_route should no longer expose API_SIMULATE_PATH (moved to simulation/routes/api_route.py)"
 
 
-@check("simulation: sim_status delegates to V1's plan_status with sim table names")
+@check("simulation: sim_status delegates to V1's plan_status with ALL 4 sim table names")
 def _():
-    """sim_status.assert_not_already_simulated() pulls the 3 sim output table names
-    from cfg['tbl'] and hands them to plan_status."""
+    """sim_status.assert_not_already_simulated() must pass ALL FOUR sim output
+    table names (kpis, plan, capacity, infeasibility) to plan_status. The
+    Infeasibility table has an auto-increment PK with NO DB-level dedupe; if
+    the duplicate check omits it, a re-run after partial cleanup silently
+    appends duplicate infeasibility rows."""
     from simulation.setups import sim_status
-    from V1.setups import plan_status
     import inspect
     src = inspect.getsource(sim_status.assert_not_already_simulated)
     assert "plan_status.assert_not_already_scheduled" in src, \
         "sim_status should delegate to V1's plan_status"
-    assert 'tbl["plan_kpis"]' in src and 'tbl["plan"]' in src and 'tbl["capacity"]' in src, \
-        "should pass the 3 sim output tables to plan_status"
+    for key in ("plan_kpis", "plan", "capacity", "infeasibility"):
+        assert f'tbl["{key}"]' in src, \
+            f"sim_status duplicate-check must include tbl[{key!r}] " \
+            f"(otherwise re-runs silently duplicate {key} rows)"
+
+
+@check("planning: api_route duplicate-check includes ALL 4 output tables (incl. infeasibility)")
+def _():
+    """Mirror of the sim check — the planning path must ALSO pass the
+    infeasibility table to plan_status, since the writer is called in
+    Phase C for BOTH modes."""
+    import inspect
+    from V1.routes import api_route as v1_api
+    src = inspect.getsource(v1_api._generate)
+    for key in ("plan_kpis", "plan", "capacity", "infeasibility"):
+        assert f'cfg["tbl"]["{key}"]' in src, \
+            f"V1 api_route._generate must include cfg['tbl'][{key!r}] in output_tables"
 
 
 @check("simulation: app.py registers BOTH planning + simulation blueprints")

@@ -1,10 +1,15 @@
 # =============================================================================
-# JK Tyre PCR planning & scheduling API
+# JK Tyre PCR planning + simulation API
 # =============================================================================
+# Exposes TWO endpoints on the same Flask app (port 5001):
+#   POST /app/v1/jkt/planning-scheduling/plan/generate-plan         (jkt_* tables)
+#   POST /app/v1/jkt/planning-scheduling/simulation/generate-plan   (jkt_sim_* tables)
+#
 # Multi-stage not needed — pure-Python wheels keep the slim base tiny enough.
 # Single-worker gunicorn matches the in-process threading.Lock in
 # schedule_route.py; do NOT bump --workers without first refactoring the
-# scheduler's Config class to not use process-global state.
+# scheduler's Config class to not use process-global state. (The same lock
+# serializes planning AND simulation runs — they share the legacy Config.)
 # =============================================================================
 FROM python:3.11-slim
 

@@ -86,8 +86,16 @@ def _generate(mode: str):
     cfg["plan"]["plan_id"] = plan_id
     cfg = config_loader.resolve_paths(cfg)
 
-    # Output tables for the duplicate check, resolved for this mode.
-    output_tables = (cfg["tbl"]["plan_kpis"], cfg["tbl"]["plan"], cfg["tbl"]["capacity"])
+    # Output tables for the duplicate check, resolved for this mode. Includes
+    # the Infeasibility table (auto-PK, no DB-level dedupe protection) so a
+    # forgotten cleanup of jkt_plan_Infeasibility doesn't silently duplicate
+    # rows on re-run.
+    output_tables = (
+        cfg["tbl"]["plan_kpis"],
+        cfg["tbl"]["plan"],
+        cfg["tbl"]["capacity"],
+        cfg["tbl"]["infeasibility"],
+    )
 
     t0 = time.time()
     stage = "init"
